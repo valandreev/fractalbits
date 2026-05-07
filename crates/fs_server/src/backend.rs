@@ -336,6 +336,7 @@ impl StorageBackend {
                 &self.root_blob_name,
                 src_key,
                 dst_key,
+                false,
                 Some(self.config.rpc_request_timeout()),
                 trace_id
             ),
