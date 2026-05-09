@@ -89,6 +89,9 @@ impl From<file_ops::NssError> for FsError {
     fn from(e: file_ops::NssError) -> Self {
         match e {
             file_ops::NssError::NotFound => FsError::NotFound,
+            // fs_server doesn't model "bucket gone" as a distinct case; the
+            // caller surfaces this as NotFound, same as a missing inode.
+            file_ops::NssError::NoSuchRootBlob => FsError::NotFound,
             file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
             file_ops::NssError::Internal(msg) => FsError::Internal(msg),
             file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
