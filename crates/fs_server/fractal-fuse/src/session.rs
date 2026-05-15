@@ -3,6 +3,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use compio_runtime::Runtime;
@@ -99,16 +100,19 @@ impl Session {
     pub fn run<F: Filesystem>(self, fs: F) -> io::Result<()> {
         let result = self.run_inner(fs, self.fd.as_fd());
 
-        // Phase 4: Unmount
-        info!("unmounting {:?}", self.mount_path);
-        if let Err(e) = mount::fusermount_unmount(&self.mount_path) {
-            warn!("unmount failed: {}", e);
+        if let Ok(true) | Err(_) = result {
+            // Phase 4: Unmount
+            info!("unmounting {:?}", self.mount_path);
+            if let Err(e) = mount::fusermount_unmount(&self.mount_path) {
+                warn!("unmount failed: {}", e);
+            }
         }
 
-        result
+        result.map(|_| ())
     }
 
-    fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<()> {
+    /// Returns whether we think the filesystem is still mounted
+    fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<bool> {
         // Phase 2: FUSE_INIT over blocking /dev/fuse
         let (max_write, num_queues) = fuse_init(fuse_fd.as_fd(), &self.mount_options)?;
         let max_payload = max_write as usize;
@@ -127,9 +131,11 @@ impl Session {
         let fuse_raw_fd = fuse_fd.as_raw_fd();
 
         let mut threads = Vec::with_capacity(num_queues);
+        let connected = Arc::new(AtomicBool::new(true));
         for queue_id in 0..num_queues {
             let fs = fs.clone();
             let shutdown = self.shutdown.clone();
+            let connected = connected.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("fuse-q{}", queue_id))
@@ -143,7 +149,7 @@ impl Session {
                         .expect("cannot create compio runtime");
 
                     rt.block_on(async {
-                        if let Err(e) = run_queue(
+                        match run_queue(
                             fuse_raw_fd,
                             queue_id as u16,
                             queue_depth,
@@ -153,7 +159,10 @@ impl Session {
                         )
                         .await
                         {
-                            error!("queue {} failed: {}", queue_id, e);
+                            Ok(queue_connected) => {
+                                connected.fetch_and(queue_connected, Ordering::Relaxed);
+                            }
+                            Err(e) => error!("queue {} failed: {}", queue_id, e),
                         }
                     });
                 })?;
@@ -167,7 +176,7 @@ impl Session {
             });
         }
 
-        Ok(())
+        Ok(connected.load(Ordering::Relaxed))
     }
 }
 
@@ -182,7 +191,7 @@ async fn run_queue<F: Filesystem>(
     max_payload: usize,
     fs: Arc<F>,
     shutdown: CancellationToken,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // Register fuse fd with this thread's io_uring
     register_files(&[fuse_raw_fd])?;
 
@@ -208,16 +217,20 @@ async fn run_queue<F: Filesystem>(
         handles.push(handle);
     }
 
+    let mut connected = true;
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
+            Ok(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                connected = false;
+            }
             Ok(Err(e)) => error!("entry task failed: {}", e),
             Err(e) => error!("entry task panicked: {:?}", e),
         }
     }
 
     unregister_files()?;
-    Ok(())
+    Ok(connected)
 }
 
 /// Run a single ring entry: register with the kernel, then loop
@@ -234,6 +247,9 @@ async fn run_entry<F: Filesystem>(
         .await;
     match result.map(|x| x.0) {
         Some(Ok(_)) => {}
+        Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
+            return Err(e);
+        }
         Some(Err(e)) => {
             return Err(io::Error::other(format!("FUSE register failed: {}", e)));
         }
@@ -252,6 +268,9 @@ async fn run_entry<F: Filesystem>(
                 .await;
             match result.map(|x| x.0) {
                 Some(Ok(_)) => {}
+                Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                    return Err(e);
+                }
                 Some(Err(e)) => {
                     error!("FUSE re-register failed: {}", e);
                     return Err(io::Error::other(e.to_string()));
@@ -271,6 +290,9 @@ async fn run_entry<F: Filesystem>(
             .await;
         match result.map(|x| x.0) {
             Some(Ok(_)) => {}
+            Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
+                return Err(e);
+            }
             Some(Err(e)) => {
                 error!("FUSE commit failed: {}", e);
                 return Err(io::Error::other(e.to_string()));
