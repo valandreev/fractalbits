@@ -1,5 +1,6 @@
-use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::{io, os::fd::OwnedFd};
 
 use crate::abi::{
     FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, fuse_notify_delete_out,
@@ -11,12 +12,13 @@ use crate::abi::{
 /// Writes notification messages directly to `/dev/fuse`. These are
 /// one-way messages (not request-response) that tell the kernel to
 /// drop cached dentries, inode attributes, or page cache ranges.
+#[derive(Clone)]
 pub struct FuseNotifier {
-    fuse_dev_fd: RawFd,
+    fuse_dev_fd: Arc<OwnedFd>,
 }
 
 impl FuseNotifier {
-    pub fn new(fuse_dev_fd: RawFd) -> Self {
+    pub(crate) fn new(fuse_dev_fd: Arc<OwnedFd>) -> Self {
         Self { fuse_dev_fd }
     }
 
@@ -96,7 +98,8 @@ impl FuseNotifier {
         ];
         let iov_count = if name.is_empty() { 2 } else { 3 };
 
-        let ret = unsafe { libc::writev(self.fuse_dev_fd, iovecs.as_mut_ptr(), iov_count) };
+        let ret =
+            unsafe { libc::writev(self.fuse_dev_fd.as_raw_fd(), iovecs.as_mut_ptr(), iov_count) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             // ENOENT means the inode/entry was already gone from kernel cache.

@@ -53,11 +53,11 @@ fn unregister_files() -> io::Result<()> {
     }
 }
 
-use crate::abi::*;
 use crate::dispatch;
 use crate::filesystem::Filesystem;
 use crate::mount::{self, MountOptions};
 use crate::ring::*;
+use crate::{FuseNotifier, abi::*};
 
 /// Default max_write size (1MB).
 const DEFAULT_MAX_WRITE: u32 = 1024 * 1024;
@@ -66,7 +66,7 @@ const DEFAULT_MAX_WRITE: u32 = 1024 * 1024;
 pub struct Session {
     mount_path: PathBuf,
     mount_options: MountOptions,
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
     queue_depth: u16,
 }
 
@@ -78,9 +78,13 @@ impl Session {
         Ok(Self {
             mount_path,
             mount_options,
-            fd,
+            fd: Arc::new(fd),
             queue_depth: DEFAULT_QUEUE_DEPTH,
         })
+    }
+
+    pub fn notifier(&self) -> FuseNotifier {
+        FuseNotifier::new(self.fd.clone())
     }
 
     pub fn queue_depth(mut self, depth: u16) -> Self {
