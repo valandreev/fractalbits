@@ -1,15 +1,42 @@
 use std::ffi::OsString;
 use std::io::{self, IoSliceMut};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use nix::sys::socket::{self, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType};
-use tracing::debug;
+use tracing::{debug, warn};
 
 fn find_fusermount3() -> io::Result<std::path::PathBuf> {
     which::which("fusermount3")
         .map_err(|err| io::Error::other(format!("find fusermount3 binary failed {err:?}")))
+}
+
+pub struct Mount {
+    fd: OwnedFd,
+    path: PathBuf,
+}
+
+impl Mount {
+    pub fn new(mount_options: &MountOptions, path: PathBuf) -> io::Result<Self> {
+        let fd = fusermount(mount_options, &path)?;
+        Ok(Self { fd, path })
+    }
+}
+
+impl AsFd for Mount {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        if let Err(e) = fusermount_unmount(&self.path) {
+            warn!("unmount failed: {}", e);
+        }
+    }
 }
 
 /// Mount a FUSE filesystem using fusermount3 (unprivileged mount).
