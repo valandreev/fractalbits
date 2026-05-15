@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::path::Path;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -56,7 +56,7 @@ fn unregister_files() -> io::Result<()> {
 use crate::abi::*;
 use crate::dispatch;
 use crate::filesystem::Filesystem;
-use crate::mount::{self, Mount, MountOptions};
+use crate::mount::{self, MountOptions};
 use crate::ring::*;
 
 /// Default max_write size (1MB).
@@ -64,16 +64,23 @@ const DEFAULT_MAX_WRITE: u32 = 1024 * 1024;
 
 /// FUSE session managing the lifecycle from mount to shutdown.
 pub struct Session {
+    mount_path: PathBuf,
     mount_options: MountOptions,
+    fd: OwnedFd,
     queue_depth: u16,
 }
 
 impl Session {
-    pub fn new(mount_options: MountOptions) -> Self {
-        Self {
+    pub fn new(mount_path: PathBuf, mount_options: MountOptions) -> io::Result<Self> {
+        info!("mounting FUSE filesystem at {:?}", mount_path);
+        let fd = mount::fusermount(&mount_options, &mount_path)?;
+        info!("FUSE fd: {}", fd.as_raw_fd());
+        Ok(Self {
+            mount_path,
             mount_options,
+            fd,
             queue_depth: DEFAULT_QUEUE_DEPTH,
-        }
+        })
     }
 
     pub fn queue_depth(mut self, depth: u16) -> Self {
@@ -81,27 +88,16 @@ impl Session {
         self
     }
 
-    pub fn run_with_mount<F: Filesystem>(self, fs: F, mount: &Mount) -> io::Result<()> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        self.run_inner(fs, mount.as_fd(), shutdown)
-    }
-
-    /// Mount, negotiate FUSE_INIT, setup io_uring rings, and run until shutdown.
+    /// Negotiate FUSE_INIT, setup io_uring rings, and run until shutdown.
     /// This function blocks the calling thread.
-    pub fn run<F: Filesystem>(self, fs: F, mount_path: &Path) -> io::Result<()> {
-        info!("mounting FUSE filesystem at {:?}", mount_path);
-
-        // Phase 1: Mount via fusermount3
-        let fuse_fd = mount::fusermount(&self.mount_options, mount_path)?;
-        info!("FUSE fd: {}", fuse_fd.as_raw_fd());
-
+    pub fn run<F: Filesystem>(self, fs: F) -> io::Result<()> {
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let result = self.run_inner(fs, fuse_fd.as_fd(), shutdown);
+        let result = self.run_inner(fs, self.fd.as_fd(), shutdown);
 
         // Phase 4: Unmount
-        info!("unmounting {:?}", mount_path);
-        if let Err(e) = mount::fusermount_unmount(mount_path) {
+        info!("unmounting {:?}", self.mount_path);
+        if let Err(e) = mount::fusermount_unmount(&self.mount_path) {
             warn!("unmount failed: {}", e);
         }
 

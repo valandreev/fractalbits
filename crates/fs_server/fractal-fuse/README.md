@@ -52,9 +52,9 @@ fn main() -> std::io::Result<()> {
         .allow_other(true)
         .default_permissions(true);
 
-    Session::new(opts)
+    Session::new("/mnt/myfs".into(), opts)?
         .queue_depth(128)
-        .run(MyFs, Path::new("/mnt/myfs"))
+        .run(MyFs)
 }
 ```
 

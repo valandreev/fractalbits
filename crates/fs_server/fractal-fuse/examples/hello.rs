@@ -262,5 +262,5 @@ fn main() -> std::io::Result<()> {
         .read_only(true)
         .default_permissions(true);
 
-    Session::new(opts).run(HelloFs, &mount_path)
+    Session::new(mount_path, opts)?.run(HelloFs)
 }
