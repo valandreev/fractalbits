@@ -3,10 +3,10 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use compio_runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const IORING_REGISTER_FILES: libc::c_uint = 2;
@@ -68,6 +68,7 @@ pub struct Session {
     mount_options: MountOptions,
     fd: Arc<OwnedFd>,
     queue_depth: u16,
+    shutdown: CancellationToken,
 }
 
 impl Session {
@@ -80,11 +81,12 @@ impl Session {
             mount_options,
             fd: Arc::new(fd),
             queue_depth: DEFAULT_QUEUE_DEPTH,
+            shutdown: CancellationToken::new(),
         })
     }
 
     pub fn notifier(&self) -> FuseNotifier {
-        FuseNotifier::new(self.fd.clone())
+        FuseNotifier::new(self.fd.clone(), self.shutdown.clone())
     }
 
     pub fn queue_depth(mut self, depth: u16) -> Self {
@@ -95,9 +97,7 @@ impl Session {
     /// Negotiate FUSE_INIT, setup io_uring rings, and run until shutdown.
     /// This function blocks the calling thread.
     pub fn run<F: Filesystem>(self, fs: F) -> io::Result<()> {
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let result = self.run_inner(fs, self.fd.as_fd(), shutdown);
+        let result = self.run_inner(fs, self.fd.as_fd());
 
         // Phase 4: Unmount
         info!("unmounting {:?}", self.mount_path);
@@ -108,12 +108,7 @@ impl Session {
         result
     }
 
-    fn run_inner<F: Filesystem>(
-        &self,
-        fs: F,
-        fuse_fd: BorrowedFd<'_>,
-        shutdown: Arc<AtomicBool>,
-    ) -> io::Result<()> {
+    fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<()> {
         // Phase 2: FUSE_INIT over blocking /dev/fuse
         let (max_write, num_queues) = fuse_init(fuse_fd.as_fd(), &self.mount_options)?;
         let max_payload = max_write as usize;
@@ -134,7 +129,7 @@ impl Session {
         let mut threads = Vec::with_capacity(num_queues);
         for queue_id in 0..num_queues {
             let fs = fs.clone();
-            let shutdown = shutdown.clone();
+            let shutdown = self.shutdown.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("fuse-q{}", queue_id))
@@ -186,7 +181,7 @@ async fn run_queue<F: Filesystem>(
     queue_depth: u16,
     max_payload: usize,
     fs: Arc<F>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
 ) -> io::Result<()> {
     // Register fuse fd with this thread's io_uring
     register_files(&[fuse_raw_fd])?;
@@ -231,38 +226,57 @@ async fn run_entry<F: Filesystem>(
     queue_id: u16,
     entry: &mut RingEntry,
     fs: &F,
-    shutdown: &AtomicBool,
+    shutdown: &CancellationToken,
 ) -> io::Result<()> {
     // Register this entry's buffers with the kernel (blocks until first request)
-    let result = compio_runtime::submit(FuseRegister::new(entry, queue_id)).await;
-    if let Err(e) = result.0 {
-        return Err(io::Error::other(format!("FUSE register failed: {}", e)));
+    let result = shutdown
+        .run_until_cancelled(compio_runtime::submit(FuseRegister::new(entry, queue_id)))
+        .await;
+    match result.map(|x| x.0) {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => {
+            return Err(io::Error::other(format!("FUSE register failed: {}", e)));
+        }
+        // Shutting down
+        None => return Ok(()),
     }
 
     // Process requests in a loop: dispatch -> commit response + fetch next
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
         let needs_response = dispatch::dispatch(fs, entry).await;
 
         if needs_response.is_none() {
             // FORGET-type op: re-register without sending a response
-            let result = compio_runtime::submit(FuseRegister::new(entry, queue_id)).await;
-            if let Err(e) = result.0 {
-                error!("FUSE re-register failed: {}", e);
-                return Err(io::Error::other(e.to_string()));
+            let result = shutdown
+                .run_until_cancelled(compio_runtime::submit(FuseRegister::new(entry, queue_id)))
+                .await;
+            match result.map(|x| x.0) {
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    error!("FUSE re-register failed: {}", e);
+                    return Err(io::Error::other(e.to_string()));
+                }
+                // Shutting down
+                None => break,
             }
             continue;
         }
 
         // Commit response + fetch next request
         let commit_id = entry.commit_id();
-        let result = compio_runtime::submit(FuseCommitAndFetch::new(queue_id, commit_id)).await;
-        if let Err(e) = result.0 {
-            error!("FUSE commit failed: {}", e);
-            return Err(io::Error::other(e.to_string()));
+        let result = shutdown
+            .run_until_cancelled(compio_runtime::submit(FuseCommitAndFetch::new(
+                queue_id, commit_id,
+            )))
+            .await;
+        match result.map(|x| x.0) {
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                error!("FUSE commit failed: {}", e);
+                return Err(io::Error::other(e.to_string()));
+            }
+            // Shutting down
+            None => break,
         }
     }
 

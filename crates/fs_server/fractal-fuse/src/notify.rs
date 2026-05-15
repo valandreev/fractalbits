@@ -2,6 +2,8 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::{io, os::fd::OwnedFd};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::abi::{
     FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, fuse_notify_delete_out,
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
@@ -15,11 +17,21 @@ use crate::abi::{
 #[derive(Clone)]
 pub struct FuseNotifier {
     fuse_dev_fd: Arc<OwnedFd>,
+    shutdown: CancellationToken,
 }
 
 impl FuseNotifier {
-    pub(crate) fn new(fuse_dev_fd: Arc<OwnedFd>) -> Self {
-        Self { fuse_dev_fd }
+    pub(crate) fn new(fuse_dev_fd: Arc<OwnedFd>, shutdown: CancellationToken) -> Self {
+        Self {
+            fuse_dev_fd,
+            shutdown,
+        }
+    }
+
+    /// Signal the [`Session`](crate::Session) to terminate after in-flight
+    /// requests are completed
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     /// Invalidate a directory entry from the kernel dcache.

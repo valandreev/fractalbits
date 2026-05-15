@@ -18,6 +18,7 @@ nix = { version = "0.31", features = ["fs", "socket", "uio"] }
 tracing = "0.1"
 which = "8"
 pin-project-lite = "0.2"
+tokio-util = "0.7.18"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
