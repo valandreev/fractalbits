@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,7 +56,7 @@ fn unregister_files() -> io::Result<()> {
 use crate::abi::*;
 use crate::dispatch;
 use crate::filesystem::Filesystem;
-use crate::mount::{self, MountOptions};
+use crate::mount::{self, Mount, MountOptions};
 use crate::ring::*;
 
 /// Default max_write size (1MB).
@@ -81,6 +81,11 @@ impl Session {
         self
     }
 
+    pub fn run_with_mount<F: Filesystem>(self, fs: F, mount: &Mount) -> io::Result<()> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        self.run_inner(fs, mount.as_fd(), shutdown)
+    }
+
     /// Mount, negotiate FUSE_INIT, setup io_uring rings, and run until shutdown.
     /// This function blocks the calling thread.
     pub fn run<F: Filesystem>(self, fs: F, mount_path: &Path) -> io::Result<()> {
@@ -92,7 +97,7 @@ impl Session {
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        let result = self.run_inner(fs, &fuse_fd, shutdown);
+        let result = self.run_inner(fs, fuse_fd.as_fd(), shutdown);
 
         // Phase 4: Unmount
         info!("unmounting {:?}", mount_path);
@@ -106,7 +111,7 @@ impl Session {
     fn run_inner<F: Filesystem>(
         &self,
         fs: F,
-        fuse_fd: &OwnedFd,
+        fuse_fd: BorrowedFd<'_>,
         shutdown: Arc<AtomicBool>,
     ) -> io::Result<()> {
         // Phase 2: FUSE_INIT over blocking /dev/fuse
