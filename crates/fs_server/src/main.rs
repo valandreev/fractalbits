@@ -13,7 +13,7 @@ use clap::Parser;
 use fractal_fuse::MountOptions;
 use fractal_fuse::Session;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .write_back(read_write && !cfg.passthrough_enabled)
                 .passthrough(cfg.passthrough_enabled);
 
-            Session::new(mount_options).run(fuse_fs, Path::new(&mount_point))?;
+            Session::new(mount_point.into(), mount_options)?.run(fuse_fs)?;
             tracing::info!("FUSE client exited");
         }
         ServerMode::Nfs => {
