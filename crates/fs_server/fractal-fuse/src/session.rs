@@ -242,19 +242,8 @@ async fn run_entry<F: Filesystem>(
     shutdown: &CancellationToken,
 ) -> io::Result<()> {
     // Register this entry's buffers with the kernel (blocks until first request)
-    let result = shutdown
-        .run_until_cancelled(compio_runtime::submit(FuseRegister::new(entry, queue_id)))
-        .await;
-    match result.map(|x| x.0) {
-        Some(Ok(_)) => {}
-        Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
-            return Err(e);
-        }
-        Some(Err(e)) => {
-            return Err(io::Error::other(format!("FUSE register failed: {}", e)));
-        }
-        // Shutting down
-        None => return Ok(()),
+    if submit_cancelable(shutdown, "register", FuseRegister::new(entry, queue_id)).await? {
+        return Ok(());
     }
 
     // Process requests in a loop: dispatch -> commit response + fetch next
@@ -263,46 +252,47 @@ async fn run_entry<F: Filesystem>(
 
         if needs_response.is_none() {
             // FORGET-type op: re-register without sending a response
-            let result = shutdown
-                .run_until_cancelled(compio_runtime::submit(FuseRegister::new(entry, queue_id)))
-                .await;
-            match result.map(|x| x.0) {
-                Some(Ok(_)) => {}
-                Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
-                    return Err(e);
-                }
-                Some(Err(e)) => {
-                    error!("FUSE re-register failed: {}", e);
-                    return Err(io::Error::other(e.to_string()));
-                }
-                // Shutting down
-                None => break,
+            if submit_cancelable(shutdown, "re-register", FuseRegister::new(entry, queue_id))
+                .await?
+            {
+                break;
             }
             continue;
         }
 
         // Commit response + fetch next request
         let commit_id = entry.commit_id();
-        let result = shutdown
-            .run_until_cancelled(compio_runtime::submit(FuseCommitAndFetch::new(
-                queue_id, commit_id,
-            )))
-            .await;
-        match result.map(|x| x.0) {
-            Some(Ok(_)) => {}
-            Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
-                return Err(e);
-            }
-            Some(Err(e)) => {
-                error!("FUSE commit failed: {}", e);
-                return Err(io::Error::other(e.to_string()));
-            }
-            // Shutting down
-            None => break,
+        if submit_cancelable(
+            shutdown,
+            "commit",
+            FuseCommitAndFetch::new(queue_id, commit_id),
+        )
+        .await?
+        {
+            break;
         }
     }
 
     Ok(())
+}
+
+/// Returns whether to shut down
+async fn submit_cancelable<'a, T: compio_driver::OpCode + 'static>(
+    token: &CancellationToken,
+    op_name: &'static str,
+    op: T,
+) -> io::Result<bool> {
+    let result = token.run_until_cancelled(compio_runtime::submit(op)).await;
+    match result.map(|x| x.0) {
+        Some(Ok(_)) => Ok(false),
+        Some(Err(e)) if e.kind() == io::ErrorKind::NotConnected => Err(e),
+        Some(Err(e)) => {
+            error!("FUSE {op_name} failed: {e}");
+            Err(io::Error::other(e.to_string()))
+        }
+        // Shutting down
+        None => Ok(true),
+    }
 }
 
 /// Perform FUSE_INIT handshake over blocking /dev/fuse.
