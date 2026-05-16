@@ -9,11 +9,12 @@ use crate::abi::{
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
 };
 
-/// Sends FUSE kernel notifications to invalidate cached entries.
+/// Handle to a [`Session`](crate::Session) and its associated FUSE connection
 ///
-/// Writes notification messages directly to `/dev/fuse`. These are
-/// one-way messages (not request-response) that tell the kernel to
-/// drop cached dentries, inode attributes, or page cache ranges.
+/// Uses in-process signalling and notification messages written directly to
+/// `/dev/fuse`. These are one-way messages (not request-response) that e.g.
+/// tell the kernel to drop cached dentries, inode attributes, or page cache
+/// ranges.
 #[derive(Clone)]
 pub struct FuseNotifier {
     fuse_dev_fd: Arc<OwnedFd>,
@@ -28,7 +29,7 @@ impl FuseNotifier {
         }
     }
 
-    /// Signal the [`Session`](crate::Session) to terminate after in-flight
+    /// Signal [`Session::run`](crate::Session::run) to terminate after in-flight
     /// requests are completed
     pub fn shutdown(&self) {
         self.shutdown.cancel();
