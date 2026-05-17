@@ -70,6 +70,7 @@ pub struct Session {
     fd: Arc<OwnedFd>,
     queue_depth: u16,
     queue_count: usize,
+    max_write: u32,
     shutdown: CancellationToken,
 }
 
@@ -84,6 +85,7 @@ impl Session {
             fd: Arc::new(fd),
             queue_depth: DEFAULT_QUEUE_DEPTH,
             queue_count: num_cpus(),
+            max_write: DEFAULT_MAX_WRITE,
             shutdown: CancellationToken::new(),
         })
     }
@@ -92,14 +94,22 @@ impl Session {
         FuseNotifier::new(self.fd.clone(), self.shutdown.clone())
     }
 
-    pub fn queue_depth(mut self, depth: u16) -> Self {
+    /// Number of io_uring entries per queue (defaults to `DEFAULT_QUEUE_DEPTH` = 256).
+    pub fn with_queue_depth(mut self, depth: u16) -> Self {
         self.queue_depth = depth;
         self
     }
 
-    /// Number threads to spawn driving io_uring queues
-    pub fn queue_count(mut self, threads: usize) -> Self {
+    /// Number of threads to spawn driving io_uring queues (defaults to num CPUs).
+    pub fn with_queue_count(mut self, threads: usize) -> Self {
         self.queue_count = threads;
+        self
+    }
+
+    /// Maximum FUSE write payload (bytes), advertised to the kernel in FUSE_INIT
+    /// (defaults to `DEFAULT_MAX_WRITE` = 1 MiB).
+    pub fn with_max_write(mut self, max_write: u32) -> Self {
+        self.max_write = max_write;
         self
     }
 
@@ -122,13 +132,13 @@ impl Session {
     /// Returns whether we think the filesystem is still mounted
     fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<bool> {
         // Phase 2: FUSE_INIT over blocking /dev/fuse
-        let max_write = fuse_init(fuse_fd.as_fd(), &self.mount_options)?;
-        let max_payload = max_write as usize;
+        fuse_init(fuse_fd.as_fd(), self.max_write, &self.mount_options)?;
+        let max_payload = self.max_write as usize;
         let queue_depth = self.queue_depth;
 
         info!(
             "FUSE_INIT done: max_write={}, queues={}, depth={}",
-            max_write, self.queue_count, queue_depth
+            self.max_write, self.queue_count, queue_depth
         );
 
         // Provide fuse fd to filesystem for passthrough ioctls
@@ -304,8 +314,7 @@ async fn submit_cancelable<'a, T: compio_driver::OpCode + 'static>(
 }
 
 /// Perform FUSE_INIT handshake over blocking /dev/fuse.
-/// Returns (max_write, num_queues).
-fn fuse_init(fuse_fd: BorrowedFd<'_>, opts: &MountOptions) -> io::Result<u32> {
+fn fuse_init(fuse_fd: BorrowedFd<'_>, max_write: u32, opts: &MountOptions) -> io::Result<()> {
     let mut buf = vec![0u8; 8192];
     let n = nix::unistd::read(fuse_fd, &mut buf).map_err(io::Error::from)?;
     if n < std::mem::size_of::<fuse_in_header>() {
@@ -409,8 +418,6 @@ fn fuse_init(fuse_fd: BorrowedFd<'_>, opts: &MountOptions) -> io::Result<u32> {
         ));
     }
 
-    let max_write = DEFAULT_MAX_WRITE;
-
     let out_hdr = fuse_out_header {
         len: (std::mem::size_of::<fuse_out_header>() + std::mem::size_of::<fuse_init_out>()) as u32,
         error: 0,
@@ -458,7 +465,7 @@ fn fuse_init(fuse_fd: BorrowedFd<'_>, opts: &MountOptions) -> io::Result<u32> {
         want_flags, max_write
     );
 
-    Ok(max_write)
+    Ok(())
 }
 
 fn num_cpus() -> usize {

@@ -53,7 +53,7 @@ fn main() -> std::io::Result<()> {
         .default_permissions(true);
 
     Session::new("/mnt/myfs".into(), opts)?
-        .queue_depth(128)
+        .with_queue_depth(128)
         .run(MyFs)
 }
 ```
