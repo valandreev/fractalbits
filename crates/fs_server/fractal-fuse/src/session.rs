@@ -4,6 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 
 use compio_runtime::Runtime;
@@ -55,9 +56,10 @@ fn unregister_files() -> io::Result<()> {
 }
 
 use crate::dispatch;
-use crate::filesystem::Filesystem;
+use crate::filesystem::{Filesystem, FsResult};
 use crate::mount::{self, MountOptions};
 use crate::ring::*;
+use crate::types::{ReplyInit, Request};
 use crate::{FuseNotifier, abi::*};
 
 /// Default max_write size (1MB).
@@ -131,32 +133,98 @@ impl Session {
 
     /// Returns whether we think the filesystem is still mounted
     fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<bool> {
-        // Build the cleanup runtime up front so a failure to allocate the
-        // io_uring resource surfaces at mount time, and so destroy() does not
-        // depend on every ring thread successfully spawning or reaching a
-        // sync point. The runtime is otherwise idle during the session.
-        let cleanup_rt = Runtime::builder().build().map_err(|e| {
-            error!("failed to create cleanup runtime for destroy hook: {e}");
-            e
-        })?;
+        let fs = Arc::new(fs);
+        let fuse_raw_fd = fuse_fd.as_raw_fd();
 
-        // Phase 2: FUSE_INIT over blocking /dev/fuse
-        fuse_init(fuse_fd.as_fd(), self.max_write, &self.mount_options)?;
-        let max_payload = self.max_write as usize;
+        // Phase 2: read kernel FUSE_INIT, run fs.init() on the lifecycle
+        // thread, then write the kernel reply.
+        let parsed = read_fuse_init(fuse_fd.as_fd())?;
+        let init_request = parsed.request;
+
+        // The lifecycle thread hosts a compio runtime dedicated to the
+        // filesystem's lifecycle hooks (init, destroy). It stays alive for
+        // the whole mount so any background tasks those hooks spawn (e.g.
+        // the disk-cache evictor's 60s timer) keep being polled. /dev/fuse
+        // never delivers FUSE_DESTROY (see abi.rs FUSE_DESTROY note), so
+        // destroy is signaled by the LifecycleGuard drop below.
+        let destroy_signal = CancellationToken::new();
+        let (init_tx, init_rx) = mpsc::sync_channel::<FsResult<ReplyInit>>(1);
+        let lifecycle_fs = fs.clone();
+        let lifecycle_destroy = destroy_signal.clone();
+        let lifecycle_thread = thread::Builder::new()
+            .name("fuse-lifecycle".to_string())
+            .spawn(move || -> io::Result<()> {
+                let rt = Runtime::builder().build().map_err(|e| {
+                    error!("failed to create lifecycle runtime: {e}");
+                    e
+                })?;
+                rt.block_on(async {
+                    match lifecycle_fs.init(init_request, fuse_raw_fd).await {
+                        Ok(reply) => {
+                            // Send reply before awaiting destroy so the
+                            // main thread can resume mount setup while
+                            // background tasks keep running here.
+                            let _ = init_tx.send(Ok(reply));
+                            lifecycle_destroy.cancelled().await;
+                            lifecycle_fs.destroy().await;
+                        }
+                        Err(errno) => {
+                            // init failed: no destroy. Thread exits, the
+                            // runtime drops, any spawned tasks are cancelled.
+                            let _ = init_tx.send(Err(errno));
+                        }
+                    }
+                });
+                Ok(())
+            })?;
+
+        let reply = match init_rx.recv() {
+            Ok(Ok(r)) => r,
+            Ok(Err(errno)) => {
+                let _ = lifecycle_thread.join();
+                return Err(io::Error::other(format!(
+                    "fs.init() failed: errno {}",
+                    errno
+                )));
+            }
+            Err(_) => {
+                let join_result = lifecycle_thread.join();
+                return Err(io::Error::other(format!(
+                    "lifecycle thread exited before init completed: {:?}",
+                    join_result
+                )));
+            }
+        };
+
+        // From here on, fs.destroy() must run on every exit path. The
+        // guard's Drop cancels the destroy signal and joins the lifecycle
+        // thread, which runs destroy on its own runtime.
+        let _lifecycle = LifecycleGuard {
+            token: destroy_signal,
+            thread: Some(lifecycle_thread),
+        };
+
+        // Cap the FS-requested max_write at the session-configured ceiling
+        // so ring buffer allocation (max_payload below) cannot underflow
+        // what we advertise to the kernel.
+        let max_write = self.max_write.min(reply.max_write);
+        write_fuse_init_reply(
+            fuse_fd.as_fd(),
+            &parsed,
+            max_write,
+            &reply,
+            &self.mount_options,
+        )?;
+
+        let max_payload = max_write as usize;
         let queue_depth = self.queue_depth;
 
         info!(
             "FUSE_INIT done: max_write={}, queues={}, depth={}",
-            self.max_write, self.queue_count, queue_depth
+            max_write, self.queue_count, queue_depth
         );
 
-        // Provide fuse fd to filesystem for passthrough ioctls
-        fs.set_fuse_dev_fd(fuse_fd.as_raw_fd());
-
         // Phase 3: Spawn per-CPU ring threads, each with its own compio Runtime
-        let fs = Arc::new(fs);
-        let fuse_raw_fd = fuse_fd.as_raw_fd();
-
         let mut threads = Vec::with_capacity(self.queue_count);
         let connected = Arc::new(AtomicBool::new(true));
         for queue_id in 0..self.queue_count {
@@ -164,7 +232,7 @@ impl Session {
             let shutdown = self.shutdown.clone();
             let connected = connected.clone();
 
-            let handle = thread::Builder::new()
+            let spawn_result = thread::Builder::new()
                 .name(format!("fuse-q{}", queue_id))
                 .spawn(move || {
                     let mut cpus = HashSet::new();
@@ -192,8 +260,32 @@ impl Session {
                             Err(e) => error!("queue {} failed: {}", queue_id, e),
                         }
                     });
-                })?;
-            threads.push(handle);
+                });
+
+            match spawn_result {
+                Ok(handle) => threads.push(handle),
+                Err(e) => {
+                    // Partial-spawn cleanup: already-started queues hold
+                    // clones of `fs` and the raw FUSE fd. Cancel the
+                    // shutdown token to wind them down, then join them
+                    // before returning. This must complete before the
+                    // LifecycleGuard's drop runs fs.destroy(), or destroy
+                    // would race with live queue threads.
+                    error!(
+                        "failed to spawn queue {} (after starting {}): {}",
+                        queue_id,
+                        threads.len(),
+                        e
+                    );
+                    self.shutdown.cancel();
+                    for h in threads {
+                        h.join().unwrap_or_else(|p| {
+                            error!("ring thread panicked during cleanup: {:?}", p);
+                        });
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         // Wait for all ring threads to complete
@@ -203,11 +295,30 @@ impl Session {
             });
         }
 
-        // /dev/fuse never delivers FUSE_DESTROY (see abi.rs FUSE_DESTROY
-        // note), so drive the hook on every exit path -- including
-        // partial-spawn failure -- using the pre-allocated runtime.
-        cleanup_rt.block_on(fs.destroy());
+        // _lifecycle drops here, signaling destroy and joining the thread.
         Ok(connected.load(Ordering::Relaxed))
+    }
+}
+
+/// RAII guard that drives `Filesystem::destroy` and joins the lifecycle
+/// thread when dropped. Constructed only after `init` succeeded, so the
+/// destroy hook runs on every post-init exit path (including panics and
+/// early returns from later setup steps).
+struct LifecycleGuard {
+    token: CancellationToken,
+    thread: Option<thread::JoinHandle<io::Result<()>>>,
+}
+
+impl Drop for LifecycleGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
+        if let Some(t) = self.thread.take() {
+            match t.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("lifecycle thread error: {}", e),
+                Err(e) => error!("lifecycle thread panicked: {:?}", e),
+            }
+        }
     }
 }
 
@@ -326,8 +437,17 @@ async fn submit_cancelable<T: compio_driver::OpCode + 'static>(
     }
 }
 
-/// Perform FUSE_INIT handshake over blocking /dev/fuse.
-fn fuse_init(fuse_fd: BorrowedFd<'_>, max_write: u32, opts: &MountOptions) -> io::Result<()> {
+/// Parsed FUSE_INIT request from the kernel, retained until the reply is
+/// sent so we can echo back `unique` and intersect capability flags.
+struct ParsedFuseInit {
+    unique: u64,
+    request: Request,
+    kernel_flags: u64,
+    kernel_max_readahead: u32,
+}
+
+/// Read and parse the kernel's FUSE_INIT request over blocking /dev/fuse.
+fn read_fuse_init(fuse_fd: BorrowedFd<'_>) -> io::Result<ParsedFuseInit> {
     let mut buf = vec![0u8; 8192];
     let n = nix::unistd::read(fuse_fd, &mut buf).map_err(io::Error::from)?;
     if n < std::mem::size_of::<fuse_in_header>() {
@@ -346,6 +466,13 @@ fn fuse_init(fuse_fd: BorrowedFd<'_>, max_write: u32, opts: &MountOptions) -> io
     }
 
     let unique = in_hdr.unique;
+    let request = Request {
+        unique,
+        uid: in_hdr.uid,
+        gid: in_hdr.gid,
+        pid: in_hdr.pid,
+    };
+
     let in_body_offset = std::mem::size_of::<fuse_in_header>();
     let init_in = unsafe { &*(buf.as_ptr().add(in_body_offset) as *const fuse_init_in) };
 
@@ -376,6 +503,26 @@ fn fuse_init(fuse_fd: BorrowedFd<'_>, max_write: u32, opts: &MountOptions) -> io
             "kernel does not support FUSE_OVER_IO_URING (requires Linux 6.14+)",
         ));
     }
+
+    Ok(ParsedFuseInit {
+        unique,
+        request,
+        kernel_flags,
+        kernel_max_readahead: init_in.max_readahead,
+    })
+}
+
+/// Send the FUSE_INIT reply: intersect the kernel's capabilities with
+/// what the mount options request, and use the filesystem's [`ReplyInit`]
+/// for `max_write`, readahead, and background tuning.
+fn write_fuse_init_reply(
+    fuse_fd: BorrowedFd<'_>,
+    parsed: &ParsedFuseInit,
+    max_write: u32,
+    reply: &ReplyInit,
+    opts: &MountOptions,
+) -> io::Result<()> {
+    let kernel_flags = parsed.kernel_flags;
 
     // Build capability flags
     let mut want_flags: u64 = FUSE_OVER_IO_URING;
@@ -431,19 +578,22 @@ fn fuse_init(fuse_fd: BorrowedFd<'_>, max_write: u32, opts: &MountOptions) -> io
         ));
     }
 
+    // The kernel proposes max_readahead; the FS can only lower it.
+    let max_readahead = parsed.kernel_max_readahead.min(reply.max_readahead);
+
     let out_hdr = fuse_out_header {
         len: (std::mem::size_of::<fuse_out_header>() + std::mem::size_of::<fuse_init_out>()) as u32,
         error: 0,
-        unique,
+        unique: parsed.unique,
     };
 
     let init_out = fuse_init_out {
         major: FUSE_KERNEL_VERSION,
         minor: FUSE_KERNEL_MINOR_VERSION,
-        max_readahead: init_in.max_readahead,
+        max_readahead,
         flags: (want_flags & 0xFFFF_FFFF) as u32,
-        max_background: 16,
-        congestion_threshold: 12,
+        max_background: reply.max_background,
+        congestion_threshold: reply.congestion_threshold,
         max_write,
         time_gran: 1,
         max_pages: (max_write / 4096).max(1) as u16,

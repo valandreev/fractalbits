@@ -279,10 +279,6 @@ impl VfsCore {
 
     // ── Passthrough helpers ──
 
-    pub fn set_fuse_dev_fd(&self, fd: i32) {
-        self.fuse_dev_fd.store(fd, Ordering::Relaxed);
-    }
-
     /// Try to set up passthrough for a file handle. Returns (open_flags, backing_id)
     /// if passthrough is activated, or (0, 0) otherwise.
     pub fn try_passthrough(&self, fh: u64, layout: &ObjectLayout) -> (u32, i32) {
@@ -1000,7 +996,8 @@ impl VfsCore {
 
     // ── Public VFS operations ──
 
-    pub fn vfs_init(&self) {
+    pub fn vfs_init(&self, fuse_dev_fd: i32) {
+        self.fuse_dev_fd.store(fuse_dev_fd, Ordering::Relaxed);
         if let Some(dc) = &self.disk_cache {
             dc.spawn_evictor();
         }

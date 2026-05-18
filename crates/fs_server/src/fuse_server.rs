@@ -37,12 +37,8 @@ fn fs_err(e: FsError) -> Errno {
 }
 
 impl Filesystem for FuseServer {
-    fn set_fuse_dev_fd(&self, fd: i32) {
-        self.vfs.set_fuse_dev_fd(fd);
-    }
-
-    async fn init(&self, _req: Request) -> FsResult<ReplyInit> {
-        self.vfs.vfs_init();
+    async fn init(&self, _req: Request, fuse_dev_fd: i32) -> FsResult<ReplyInit> {
+        self.vfs.vfs_init(fuse_dev_fd);
         Ok(ReplyInit {
             max_write: 1024 * 1024,
             ..Default::default()
