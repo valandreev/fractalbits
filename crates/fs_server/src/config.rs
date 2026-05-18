@@ -19,7 +19,6 @@ pub struct Config {
     pub rpc_request_timeout_seconds: u64,
     pub rpc_connection_timeout_seconds: u64,
     pub rss_rpc_timeout_seconds: u64,
-    #[allow(dead_code)]
     pub worker_threads: usize,
     pub allow_other: bool,
     #[allow(dead_code)]
@@ -83,6 +82,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("FS_SERVER_NFS_PORT") {
             self.nfs_port = v.parse().unwrap_or(self.nfs_port);
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
+            self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
     }
 }

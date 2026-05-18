@@ -112,8 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .write_back(read_write && !cfg.passthrough_enabled)
                 .passthrough(cfg.passthrough_enabled);
 
-            Session::new(mount_point.into(), mount_options)?.run(fuse_fs)?;
-            tracing::info!("FUSE client exited");
+            Session::new(mount_point.into(), mount_options)?
+                .with_worker_count(cfg.worker_threads)
+                .run(fuse_fs)?;
+            tracing::info!("FUSE server exited");
         }
         ServerMode::Nfs => {
             tracing::info!(port = cfg.nfs_port, "Starting NFS server");

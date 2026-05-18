@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +72,7 @@ pub struct Session {
     mount_options: MountOptions,
     fd: Arc<OwnedFd>,
     queue_depth: u16,
-    queue_count: usize,
+    worker_count: usize,
     max_write: u32,
     shutdown: CancellationToken,
 }
@@ -86,7 +87,7 @@ impl Session {
             mount_options,
             fd: Arc::new(fd),
             queue_depth: DEFAULT_QUEUE_DEPTH,
-            queue_count: num_cpus(),
+            worker_count: num_possible_cpus(),
             max_write: DEFAULT_MAX_WRITE,
             shutdown: CancellationToken::new(),
         })
@@ -104,9 +105,18 @@ impl Session {
         self
     }
 
-    /// Number of threads to spawn driving io_uring queues (defaults to num CPUs).
-    pub fn with_queue_count(mut self, threads: usize) -> Self {
-        self.queue_count = threads;
+    /// Number of worker threads driving io_uring rings (defaults to the
+    /// number of possible CPUs).
+    ///
+    /// The kernel always allocates one fuse-uring queue per possible CPU
+    /// and routes each request to qid = task_cpu() of the caller. So we
+    /// must still register entries for every qid in `0..num_possible_cpus`,
+    /// otherwise requests from un-covered CPUs hang forever. When
+    /// `worker_count < num_possible_cpus`, qids are distributed across
+    /// workers in a stride so every qid is covered. Capped at
+    /// `num_possible_cpus` internally; setting more is a no-op.
+    pub fn with_worker_count(mut self, workers: usize) -> Self {
+        self.worker_count = workers;
         self
     }
 
@@ -220,62 +230,115 @@ impl Session {
         let max_payload = max_write as usize;
         let queue_depth = self.queue_depth;
 
+        // The kernel allocates `nr_queues = num_possible_cpus()` fuse-uring
+        // queues and routes each request to qid = task_cpu(); when
+        // task_cpu() >= nr_queues (non-contiguous possible mask) the
+        // dispatch path falls back to qid 0. We must register at least one
+        // entry for every qid in `0..num_qids`, otherwise ops from
+        // un-covered qids hang waiting for an entry. num_qids is the
+        // kernel's count, not max_id+1: that's what the kernel actually
+        // allocates and what the dispatch path bounds-checks against.
+        let num_qids = num_possible_cpus();
+        let workers = self.worker_count.min(num_qids).max(1);
+
         info!(
-            "FUSE_INIT done: max_write={}, queues={}, depth={}",
-            max_write, self.queue_count, queue_depth
+            "FUSE_INIT done: max_write={}, workers={}, qids={}, depth={}",
+            max_write, workers, num_qids, queue_depth
         );
 
-        // Phase 3: Spawn per-CPU ring threads, each with its own compio Runtime
-        let mut threads = Vec::with_capacity(self.queue_count);
+        // Phase 3: Spawn `workers` threads, each running a compio Runtime
+        // that drives a stride of qids: worker `w` handles
+        // `qid in {w, w + workers, w + 2*workers, ...}` while `qid < num_qids`.
+        let mut threads = Vec::with_capacity(workers);
         let connected = Arc::new(AtomicBool::new(true));
+        // Set by any worker that exits with an Err so the session returns
+        // Err on this path instead of swallowing the failure as a clean
+        // shutdown.
+        let any_failed = Arc::new(AtomicBool::new(false));
         let fuse_raw_fd = self.fd.as_raw_fd();
-        for queue_id in 0..self.queue_count {
+        for worker_id in 0..workers {
+            let qids: Vec<u16> = (worker_id..num_qids)
+                .step_by(workers)
+                .map(|q| q as u16)
+                .collect();
             let fs = fs.clone();
             let shutdown = self.shutdown.clone();
             let connected = connected.clone();
+            let any_failed = any_failed.clone();
 
             let spawn_result = thread::Builder::new()
-                .name(format!("fuse-q{}", queue_id))
+                .name(format!("fuse-w{}", worker_id))
                 .spawn(move || {
-                    let mut cpus = HashSet::new();
-                    cpus.insert(queue_id);
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut cpus = HashSet::new();
+                        // Pin to the first qid's CPU as a hint; other qids
+                        // serviced by this worker are owned by other CPUs but
+                        // routing is per-request, not thread-bound.
+                        cpus.insert(worker_id);
 
-                    let rt = Runtime::builder()
-                        .thread_affinity(cpus)
-                        .build()
-                        .expect("cannot create compio runtime");
-
-                    rt.block_on(async {
-                        match run_queue(
-                            fuse_raw_fd,
-                            queue_id as u16,
-                            queue_depth,
-                            max_payload,
-                            fs,
-                            shutdown,
-                        )
-                        .await
-                        {
-                            Ok(queue_connected) => {
-                                connected.fetch_and(queue_connected, Ordering::Relaxed);
+                        let rt = match Runtime::builder().thread_affinity(cpus).build() {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                error!("worker {} failed to create runtime: {}", worker_id, e);
+                                any_failed.store(true, Ordering::Relaxed);
+                                shutdown.cancel();
+                                return;
                             }
-                            Err(e) => error!("queue {} failed: {}", queue_id, e),
-                        }
-                    });
+                        };
+
+                        let shutdown_for_run = shutdown.clone();
+                        rt.block_on(async {
+                            match run_worker(
+                                fuse_raw_fd,
+                                &qids,
+                                queue_depth,
+                                max_payload,
+                                fs,
+                                shutdown_for_run,
+                            )
+                            .await
+                            {
+                                Ok(worker_connected) => {
+                                    connected.fetch_and(worker_connected, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    error!("worker {} failed: {}", worker_id, e);
+                                    any_failed.store(true, Ordering::Relaxed);
+                                    // Wake up peer workers: their REGISTER ops
+                                    // block on kernel-side request delivery. If
+                                    // this worker's qids are now uncovered, the
+                                    // kernel can route requests there and stall
+                                    // the mount; if any qid this worker owned
+                                    // was the only registrant, others won't
+                                    // unblock without an external signal.
+                                    // Cancel the shared shutdown so every
+                                    // worker exits its REGISTER and lets the
+                                    // session unwind cleanly.
+                                    shutdown.cancel();
+                                }
+                            }
+                        });
+                    }));
+
+                    if let Err(e) = result {
+                        error!("worker {} panicked: {:?}", worker_id, e);
+                        any_failed.store(true, Ordering::Relaxed);
+                        shutdown.cancel();
+                    }
                 });
 
             match spawn_result {
                 Ok(handle) => threads.push(handle),
                 Err(e) => {
-                    // Partial-spawn cleanup: already-started queues hold
+                    // Partial-spawn cleanup: already-started workers hold
                     // clones of `fs` and the raw FUSE fd. Cancel the
                     // shutdown token to wind them down, then join them
                     // before returning. This must complete before the
                     // LifecycleGuard's drop runs fs.destroy(), or destroy
-                    // would race with live queue threads.
+                    // would race with live worker threads.
                     error!(
-                        "failed to spawn queue {} (after starting {}): {}",
-                        queue_id,
+                        "failed to spawn worker {} (after starting {}): {}",
+                        worker_id,
                         threads.len(),
                         e
                     );
@@ -290,14 +353,18 @@ impl Session {
             }
         }
 
-        // Wait for all ring threads to complete
+        // Wait for all ring threads to complete. Panics inside the worker
+        // closure are caught via panic::catch_unwind above (where they're
+        // recorded in `any_failed` and trigger shutdown.cancel()), so
+        // handle.join() should always return Ok here.
         for handle in threads {
-            handle.join().unwrap_or_else(|e| {
-                error!("ring thread panicked: {:?}", e);
-            });
+            let _ = handle.join();
         }
 
         // _lifecycle drops here, signaling destroy and joining the thread.
+        if any_failed.load(Ordering::Relaxed) {
+            return Err(io::Error::other("fuse worker failed"));
+        }
         Ok(connected.load(Ordering::Relaxed))
     }
 }
@@ -328,53 +395,68 @@ impl Drop for LifecycleGuard {
 /// Spawns an independent task per ring entry so they can process requests
 /// concurrently (register blocks until the kernel sends a request, so
 /// sequential registration would deadlock).
-async fn run_queue<F: Filesystem>(
+async fn run_worker<F: Filesystem>(
     fuse_raw_fd: i32,
-    queue_id: u16,
+    qids: &[u16],
     queue_depth: u16,
     max_payload: usize,
     fs: Arc<F>,
     shutdown: CancellationToken,
 ) -> io::Result<bool> {
-    // Register fuse fd with this thread's io_uring
+    // Register fuse fd with this worker's io_uring (once per thread).
     register_files(&[fuse_raw_fd])?;
 
     debug!(
-        "queue {}: registered fuse fd, allocating {} entries",
-        queue_id, queue_depth
+        "worker registered fuse fd, allocating {} entries per qid for qids {:?}",
+        queue_depth, qids
     );
 
-    // Allocate page-aligned buffers
-    let entries = allocate_ring_entries(queue_depth, max_payload)?;
-
-    // Spawn independent task per entry: each registers with the kernel and
-    // then loops dispatching requests. This avoids deadlock since REGISTER
-    // blocks until the kernel delivers a request to that entry.
-    let mut handles = Vec::with_capacity(entries.len());
-    for mut entry in entries {
-        let fs = fs.clone();
-        let shutdown = shutdown.clone();
-        let handle =
-            compio_runtime::spawn(
-                async move { run_entry(queue_id, &mut entry, &*fs, &shutdown).await },
-            );
-        handles.push(handle);
+    // Spawn independent task per (qid, entry): each registers with the
+    // kernel and then loops dispatching requests. This avoids deadlock
+    // since REGISTER blocks until the kernel delivers a request to that
+    // entry. All tasks share the worker's single compio runtime.
+    let mut handles = Vec::with_capacity(qids.len() * queue_depth as usize);
+    for &qid in qids {
+        // Allocate page-aligned buffers; one set per qid.
+        let entries = allocate_ring_entries(queue_depth, max_payload)?;
+        for mut entry in entries {
+            let fs = fs.clone();
+            let shutdown = shutdown.clone();
+            let handle =
+                compio_runtime::spawn(
+                    async move { run_entry(qid, &mut entry, &*fs, &shutdown).await },
+                );
+            handles.push(handle);
+        }
     }
 
     let mut connected = true;
+    let mut failed = false;
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
                 connected = false;
             }
-            Ok(Err(e)) => error!("entry task failed: {}", e),
-            Err(e) => error!("entry task panicked: {:?}", e),
+            Ok(Err(e)) => {
+                error!("entry task failed: {}", e);
+                failed = true;
+                shutdown.cancel();
+            }
+            Err(e) => {
+                error!("entry task panicked: {:?}", e);
+                failed = true;
+                shutdown.cancel();
+            }
         }
     }
 
     unregister_files()?;
-    Ok(connected)
+    if failed {
+        Err(io::Error::other("fuse entry task failed"))
+    } else {
+        Ok(connected)
+    }
 }
 
 /// Run a single ring entry: register with the kernel, then loop
@@ -633,8 +715,94 @@ fn write_fuse_init_reply(
     Ok(())
 }
 
-fn num_cpus() -> usize {
+/// Returns the kernel's `num_possible_cpus()` count, i.e. how many fuse-uring
+/// qids the kernel will allocate (`ring->nr_queues`). This is a *count*, not
+/// a max-id, mirroring the kernel definition (`cpumask_weight(cpu_possible_mask)`).
+/// On non-contiguous masks like `0-3,7-11` the kernel allocates 9 queues
+/// (indexed `0..=8`) and the dispatch path falls back to `qid = 0` when
+/// `task_cpu(current) >= nr_queues`, so registering up to the count is both
+/// necessary and sufficient.
+///
+/// `std::thread::available_parallelism()` is intentionally NOT used here:
+/// it reports the process's allowed parallelism, which can be shrunk by
+/// cpusets, taskset, container CPU limits, and similar mechanisms. The
+/// kernel's fuse-uring still allocates queues against the full possible
+/// CPU range, so under-registering would leave qids un-covered and
+/// requests routed there would hang.
+fn num_possible_cpus() -> usize {
+    match std::fs::read_to_string("/sys/devices/system/cpu/possible") {
+        Ok(s) => parse_cpu_list_count(s.trim()).unwrap_or_else(fallback_cpus),
+        Err(_) => fallback_cpus(),
+    }
+}
+
+fn fallback_cpus() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Parse a Linux cpu list (e.g. `"0-23"`, `"0-3,7-11"`, `"5"`) into the
+/// total CPU count, matching the kernel's `cpumask_weight(cpu_possible_mask)`.
+/// Returns `None` if the input is malformed or empty.
+fn parse_cpu_list_count(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut count: usize = 0;
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let n = match part.split_once('-') {
+            Some((lo, hi)) => {
+                let lo: usize = lo.parse().ok()?;
+                let hi: usize = hi.parse().ok()?;
+                if hi < lo {
+                    return None;
+                }
+                hi - lo + 1
+            }
+            None => {
+                part.parse::<usize>().ok()?;
+                1
+            }
+        };
+        count = count.checked_add(n)?;
+    }
+    if count == 0 { None } else { Some(count) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cpu_list_count;
+
+    #[test]
+    fn parse_contiguous() {
+        assert_eq!(parse_cpu_list_count("0-23"), Some(24));
+    }
+
+    #[test]
+    fn parse_single() {
+        assert_eq!(parse_cpu_list_count("0"), Some(1));
+        assert_eq!(parse_cpu_list_count("5"), Some(1));
+    }
+
+    #[test]
+    fn parse_non_contiguous() {
+        // 0-3 = 4 CPUs, 7-11 = 5 CPUs. Kernel's nr_queues = 9, so qids
+        // 0..=8 cover task_cpu() <= 8 directly. Only task_cpu() in {9,
+        // 10, 11} (>= 9) falls back to qid 0.
+        assert_eq!(parse_cpu_list_count("0-3,7-11"), Some(9));
+    }
+
+    #[test]
+    fn parse_malformed() {
+        assert_eq!(parse_cpu_list_count(""), None);
+        assert_eq!(parse_cpu_list_count("abc"), None);
+        assert_eq!(parse_cpu_list_count("0-x"), None);
+        assert_eq!(parse_cpu_list_count("5-2"), None);
+        assert_eq!(parse_cpu_list_count("0,,3"), None);
+    }
 }

@@ -14,8 +14,9 @@ userspace filesystem I/O with zero-copy buffer registration.
 
 - **io_uring-native FUSE transport** -- Uses `FUSE_IO_URING_CMD_REGISTER` and
   `FUSE_IO_URING_CMD_COMMIT_AND_FETCH` for zero-copy request/response cycles
-- **Per-CPU queue architecture** -- Spawns one io_uring ring per CPU core with
-  thread affinity for cache-friendly processing
+- **Thread-per-core io_uring rings** -- One worker per CPU by default,
+  each with thread affinity and its own compio runtime; `with_worker_count`
+  optionally folds onto fewer threads while still covering every kernel qid
 - **Async filesystem trait** -- Implement the `Filesystem` trait with async
   methods; unimplemented operations default to `ENOSYS`
 - **Unprivileged mounting** -- Uses `fusermount3` for non-root mounts
@@ -65,14 +66,19 @@ Session::run()
   |
   +-- fusermount3 (mount, receive /dev/fuse fd)
   +-- FUSE_INIT handshake (blocking read/write on /dev/fuse)
-  +-- Per-CPU ring threads (each with compio Runtime + thread affinity)
+  +-- one worker thread per CPU (each with compio Runtime + thread affinity)
         |
         +-- RingEntry buffers (page-aligned, mmap'd)
         +-- FuseRegister (register buffers with kernel)
         +-- Loop: dispatch request -> FuseCommitAndFetch (respond + fetch next)
 ```
 
-Each ring thread runs a compio single-threaded runtime pinned to a CPU core.
+By default, one worker thread runs per CPU, each pinned to its own core with
+a compio single-threaded runtime. This matches the kernel's fuse-uring model
+(one queue per possible CPU, requests routed by `task_cpu(caller)`). Setting
+`with_worker_count(n)` collapses onto fewer threads while still covering
+every kernel qid.
+
 Ring entries use page-aligned `mmap` buffers for the header (288 bytes) and
 payload (up to `max_write` bytes, default 1MB). The kernel fills request data
 directly into these buffers, and responses are written back in-place.
@@ -83,7 +89,7 @@ Implement the
 [`Filesystem`](https://docs.rs/fractal-fuse/latest/fractal_fuse/filesystem/trait.Filesystem.html)
 trait to handle FUSE operations. All methods are async (`!Send`, matching
 compio's single-threaded model) and default to returning `ENOSYS`. The trait
-itself is `Send + Sync` for sharing via `Arc` across ring threads.
+itself is `Send + Sync` for sharing via `Arc` across worker threads.
 
 Supported operations follow the low-level
 [FUSE API](https://libfuse.github.io/doxygen/structfuse__lowlevel__ops.html):
