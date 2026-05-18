@@ -1,4 +1,6 @@
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 use crate::types::*;
 
@@ -14,14 +16,16 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Initialize the filesystem.
     ///
     /// Called once during mount before any other operations. `fuse_dev_fd`
-    /// is the kernel `/dev/fuse` fd this session is bound to; store it if
-    /// the implementation needs it for passthrough ioctls. Returns
-    /// [`ReplyInit`] containing `max_write` size and capability hints that
-    /// the kernel negotiates with the FUSE client.
+    /// is a shared handle to the kernel `/dev/fuse` connection this session
+    /// is bound to. Store it (clone the `Arc`) if the implementation needs
+    /// the raw fd for passthrough ioctls or wants to construct a
+    /// [`FuseNotifier`](crate::FuseNotifier) for sending unsolicited
+    /// notifications. Returns [`ReplyInit`] containing `max_write` size and
+    /// capability hints that the kernel negotiates with the FUSE client.
     fn init(
         &self,
         req: Request,
-        fuse_dev_fd: i32,
+        fuse_dev_fd: Arc<OwnedFd>,
     ) -> impl std::future::Future<Output = FsResult<ReplyInit>> {
         let _ = (req, fuse_dev_fd);
         async { Ok(ReplyInit::default()) }

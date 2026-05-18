@@ -1,40 +1,33 @@
-use std::os::fd::AsRawFd;
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::{io, os::fd::OwnedFd};
-
-use tokio_util::sync::CancellationToken;
 
 use crate::abi::{
     FUSE_NOTIFY_DELETE, FUSE_NOTIFY_INVAL_ENTRY, FUSE_NOTIFY_INVAL_INODE, fuse_notify_delete_out,
     fuse_notify_inval_entry_out, fuse_notify_inval_inode_out, fuse_out_header,
 };
 
-/// Handle to a [`Session`](crate::Session) and its associated FUSE connection
+/// Handle for sending unsolicited notifications to the FUSE kernel module.
 ///
-/// Uses in-process signalling and notification messages written directly to
-/// `/dev/fuse`. These are one-way messages (not request-response) that e.g.
-/// tell the kernel to drop cached dentries, inode attributes, or page cache
-/// ranges.
+/// Writes one-way messages (not request/response) directly to `/dev/fuse`,
+/// telling the kernel to drop cached dentries, inode attributes, or
+/// page-cache ranges when underlying data changes outside the kernel's
+/// view. Shares ownership of the `/dev/fuse` fd via `Arc<OwnedFd>`, so the
+/// fd stays open for as long as any clone exists. Construct one from the
+/// `Arc<OwnedFd>` handed to
+/// [`Filesystem::init`](crate::Filesystem::init) via `.into()`.
 #[derive(Clone)]
 pub struct FuseNotifier {
     fuse_dev_fd: Arc<OwnedFd>,
-    shutdown: CancellationToken,
+}
+
+impl From<Arc<OwnedFd>> for FuseNotifier {
+    fn from(fuse_dev_fd: Arc<OwnedFd>) -> Self {
+        Self { fuse_dev_fd }
+    }
 }
 
 impl FuseNotifier {
-    pub(crate) fn new(fuse_dev_fd: Arc<OwnedFd>, shutdown: CancellationToken) -> Self {
-        Self {
-            fuse_dev_fd,
-            shutdown,
-        }
-    }
-
-    /// Signal [`Session::run`](crate::Session::run) to terminate after in-flight
-    /// requests are completed
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
-    }
-
     /// Invalidate a directory entry from the kernel dcache.
     /// After this, the kernel will re-issue LOOKUP for this name.
     pub fn inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {

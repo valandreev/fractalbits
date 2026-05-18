@@ -1,5 +1,6 @@
 use fractal_fuse::*;
 use std::ffi::OsStr;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use crate::error::FsError;
@@ -37,7 +38,7 @@ fn fs_err(e: FsError) -> Errno {
 }
 
 impl Filesystem for FuseServer {
-    async fn init(&self, _req: Request, fuse_dev_fd: i32) -> FsResult<ReplyInit> {
+    async fn init(&self, _req: Request, fuse_dev_fd: Arc<OwnedFd>) -> FsResult<ReplyInit> {
         self.vfs.vfs_init(fuse_dev_fd);
         Ok(ReplyInit {
             max_write: 1024 * 1024,

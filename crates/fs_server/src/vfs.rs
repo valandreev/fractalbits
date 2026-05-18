@@ -1,10 +1,12 @@
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use data_types::TraceId;
+use parking_lot::RwLock;
 use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, StorageBackend};
@@ -91,7 +93,7 @@ pub struct VfsCore {
     read_write: bool,
     passthrough_enabled: bool,
     passthrough_max_object_size: u64,
-    fuse_dev_fd: AtomicI32,
+    fuse_dev_fd: RwLock<Option<Arc<OwnedFd>>>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
     deferred_blob_cleanup: DashMap<u64, Bytes>,
@@ -143,7 +145,7 @@ impl VfsCore {
             read_write,
             passthrough_enabled,
             passthrough_max_object_size,
-            fuse_dev_fd: AtomicI32::new(-1),
+            fuse_dev_fd: RwLock::new(None),
             deferred_blob_cleanup: DashMap::new(),
         }
     }
@@ -311,10 +313,13 @@ impl VfsCore {
             return (0, 0);
         }
 
-        let fuse_fd = self.fuse_dev_fd.load(Ordering::Relaxed);
-        if fuse_fd < 0 {
-            return (0, 0);
-        }
+        // Clone the Arc under the lock so the fd stays open even if
+        // vfs_destroy clears the slot concurrently with this syscall.
+        let fuse_dev_fd = match self.fuse_dev_fd.read().as_ref() {
+            Some(fd) => fd.clone(),
+            None => return (0, 0),
+        };
+        let fuse_fd = fuse_dev_fd.as_raw_fd();
 
         // Open the cache file and register as backing fd
         let cache_path = dc.cache_file_path(blob_guid.blob_id, blob_guid.volume_id);
@@ -326,7 +331,6 @@ impl VfsCore {
             }
         };
 
-        use std::os::fd::AsRawFd;
         let backing_fd = backing_file.as_raw_fd();
 
         match fractal_fuse::passthrough::fuse_backing_open(fuse_fd, backing_fd) {
@@ -357,9 +361,10 @@ impl VfsCore {
         let backing_id = self.file_handles.get(&fh).and_then(|h| h.backing_id);
 
         if let Some(bid) = backing_id {
-            let fuse_fd = self.fuse_dev_fd.load(Ordering::Relaxed);
-            if fuse_fd >= 0
-                && let Err(e) = fractal_fuse::passthrough::fuse_backing_close(fuse_fd, bid)
+            let fuse_dev_fd = self.fuse_dev_fd.read().as_ref().cloned();
+            if let Some(fuse_dev_fd) = fuse_dev_fd
+                && let Err(e) =
+                    fractal_fuse::passthrough::fuse_backing_close(fuse_dev_fd.as_raw_fd(), bid)
             {
                 tracing::warn!(backing_id = bid, error = %e, "failed to close backing");
             }
@@ -996,8 +1001,13 @@ impl VfsCore {
 
     // ── Public VFS operations ──
 
-    pub fn vfs_init(&self, fuse_dev_fd: i32) {
-        self.fuse_dev_fd.store(fuse_dev_fd, Ordering::Relaxed);
+    pub fn vfs_init(&self, fuse_dev_fd: Arc<OwnedFd>) {
+        let mut slot = self.fuse_dev_fd.write();
+        if slot.is_some() {
+            tracing::warn!("vfs_init called with a fuse fd already present; replacing it");
+        }
+        *slot = Some(fuse_dev_fd);
+        drop(slot);
         if let Some(dc) = &self.disk_cache {
             dc.spawn_evictor();
         }
@@ -1005,6 +1015,9 @@ impl VfsCore {
     }
 
     pub fn vfs_destroy(&self) {
+        // Drop the fuse fd Arc so the OS-level fd closes with the Session
+        // and a subsequent vfs_init can install a fresh handle.
+        *self.fuse_dev_fd.write() = None;
         tracing::info!("Filesystem destroyed");
     }
 

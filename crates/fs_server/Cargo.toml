@@ -48,6 +48,7 @@ xxhash-rust.workspace = true
 lru.workspace = true
 libc.workspace = true
 nix.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 compio-macros.workspace = true

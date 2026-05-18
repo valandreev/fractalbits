@@ -55,12 +55,12 @@ fn unregister_files() -> io::Result<()> {
     }
 }
 
+use crate::abi::*;
 use crate::dispatch;
 use crate::filesystem::{Filesystem, FsResult};
 use crate::mount::{self, MountOptions};
 use crate::ring::*;
 use crate::types::{ReplyInit, Request};
-use crate::{FuseNotifier, abi::*};
 
 /// Default max_write size (1MB).
 const DEFAULT_MAX_WRITE: u32 = 1024 * 1024;
@@ -92,8 +92,10 @@ impl Session {
         })
     }
 
-    pub fn notifier(&self) -> FuseNotifier {
-        FuseNotifier::new(self.fd.clone(), self.shutdown.clone())
+    /// Token to signal [`Session::run`](crate::Session::run) to terminate after in-flight
+    /// requests are completed
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Number of io_uring entries per queue (defaults to `DEFAULT_QUEUE_DEPTH` = 256).
@@ -118,7 +120,7 @@ impl Session {
     /// Negotiate FUSE_INIT, setup io_uring rings, and run until shutdown.
     /// This function blocks the calling thread.
     pub fn run<F: Filesystem>(self, fs: F) -> io::Result<()> {
-        let result = self.run_inner(fs, self.fd.as_fd());
+        let result = self.run_inner(fs);
 
         if let Ok(true) | Err(_) = result {
             // Phase 4: Unmount
@@ -132,13 +134,11 @@ impl Session {
     }
 
     /// Returns whether we think the filesystem is still mounted
-    fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<bool> {
+    fn run_inner<F: Filesystem>(&self, fs: F) -> io::Result<bool> {
         let fs = Arc::new(fs);
-        let fuse_raw_fd = fuse_fd.as_raw_fd();
-
         // Phase 2: read kernel FUSE_INIT, run fs.init() on the lifecycle
         // thread, then write the kernel reply.
-        let parsed = read_fuse_init(fuse_fd.as_fd())?;
+        let parsed = read_fuse_init(self.fd.as_fd())?;
         let init_request = parsed.request;
 
         // The lifecycle thread hosts a compio runtime dedicated to the
@@ -151,6 +151,7 @@ impl Session {
         let (init_tx, init_rx) = mpsc::sync_channel::<FsResult<ReplyInit>>(1);
         let lifecycle_fs = fs.clone();
         let lifecycle_destroy = destroy_signal.clone();
+        let fuse_dev_fd = self.fd.clone();
         let lifecycle_thread = thread::Builder::new()
             .name("fuse-lifecycle".to_string())
             .spawn(move || -> io::Result<()> {
@@ -159,7 +160,7 @@ impl Session {
                     e
                 })?;
                 rt.block_on(async {
-                    match lifecycle_fs.init(init_request, fuse_raw_fd).await {
+                    match lifecycle_fs.init(init_request, fuse_dev_fd).await {
                         Ok(reply) => {
                             // Send reply before awaiting destroy so the
                             // main thread can resume mount setup while
@@ -209,7 +210,7 @@ impl Session {
         // what we advertise to the kernel.
         let max_write = self.max_write.min(reply.max_write);
         write_fuse_init_reply(
-            fuse_fd.as_fd(),
+            self.fd.as_fd(),
             &parsed,
             max_write,
             &reply,
@@ -227,6 +228,7 @@ impl Session {
         // Phase 3: Spawn per-CPU ring threads, each with its own compio Runtime
         let mut threads = Vec::with_capacity(self.queue_count);
         let connected = Arc::new(AtomicBool::new(true));
+        let fuse_raw_fd = self.fd.as_raw_fd();
         for queue_id in 0..self.queue_count {
             let fs = fs.clone();
             let shutdown = self.shutdown.clone();
