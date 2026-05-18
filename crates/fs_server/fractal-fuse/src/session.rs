@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use compio_runtime::Runtime;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -415,25 +416,30 @@ async fn run_worker<F: Filesystem>(
     // kernel and then loops dispatching requests. This avoids deadlock
     // since REGISTER blocks until the kernel delivers a request to that
     // entry. All tasks share the worker's single compio runtime.
-    let mut handles = Vec::with_capacity(qids.len() * queue_depth as usize);
+    //
+    // We collect handles into a FuturesUnordered and await in completion
+    // order rather than spawn order: REGISTER blocks indefinitely, so a
+    // later entry that fails or panics while an earlier one is still
+    // parked must be observable immediately. Spawn-order draining would
+    // miss it, leaving shutdown un-cancelled and the mount hung.
+    let handles: FuturesUnordered<_> = FuturesUnordered::new();
     for &qid in qids {
         // Allocate page-aligned buffers; one set per qid.
         let entries = allocate_ring_entries(queue_depth, max_payload)?;
         for mut entry in entries {
             let fs = fs.clone();
             let shutdown = shutdown.clone();
-            let handle =
-                compio_runtime::spawn(
-                    async move { run_entry(qid, &mut entry, &*fs, &shutdown).await },
-                );
-            handles.push(handle);
+            handles.push(compio_runtime::spawn(async move {
+                run_entry(qid, &mut entry, &*fs, &shutdown).await
+            }));
         }
     }
 
     let mut connected = true;
     let mut failed = false;
-    for handle in handles {
-        match handle.await {
+    let mut handles = handles;
+    while let Some(result) = handles.next().await {
+        match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
                 connected = false;
