@@ -131,6 +131,15 @@ impl Session {
 
     /// Returns whether we think the filesystem is still mounted
     fn run_inner<F: Filesystem>(&self, fs: F, fuse_fd: BorrowedFd<'_>) -> io::Result<bool> {
+        // Build the cleanup runtime up front so a failure to allocate the
+        // io_uring resource surfaces at mount time, and so destroy() does not
+        // depend on every ring thread successfully spawning or reaching a
+        // sync point. The runtime is otherwise idle during the session.
+        let cleanup_rt = Runtime::builder().build().map_err(|e| {
+            error!("failed to create cleanup runtime for destroy hook: {e}");
+            e
+        })?;
+
         // Phase 2: FUSE_INIT over blocking /dev/fuse
         fuse_init(fuse_fd.as_fd(), self.max_write, &self.mount_options)?;
         let max_payload = self.max_write as usize;
@@ -194,6 +203,10 @@ impl Session {
             });
         }
 
+        // /dev/fuse never delivers FUSE_DESTROY (see abi.rs FUSE_DESTROY
+        // note), so drive the hook on every exit path -- including
+        // partial-spawn failure -- using the pre-allocated runtime.
+        cleanup_rt.block_on(fs.destroy());
         Ok(connected.load(Ordering::Relaxed))
     }
 }
@@ -295,7 +308,7 @@ async fn run_entry<F: Filesystem>(
 }
 
 /// Returns whether to shut down
-async fn submit_cancelable<'a, T: compio_driver::OpCode + 'static>(
+async fn submit_cancelable<T: compio_driver::OpCode + 'static>(
     token: &CancellationToken,
     op_name: &'static str,
     op: T,

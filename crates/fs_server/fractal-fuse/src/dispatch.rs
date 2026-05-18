@@ -390,7 +390,11 @@ async fn dispatch_with_reply<F: Filesystem>(
             }
         }
         FUSE_DESTROY => {
-            fs.destroy().await;
+            // Not expected on /dev/fuse mounts (see abi.rs FUSE_DESTROY note);
+            // destroy() is driven from session.rs after the ring threads exit.
+            // Acknowledge with Empty (zero-error, zero-body success reply)
+            // rather than panicking the queue thread in release builds.
+            debug_assert!(false, "FUSE_DESTROY unexpected on /dev/fuse mount");
             DispatchResult::Empty
         }
         FUSE_STATX => {

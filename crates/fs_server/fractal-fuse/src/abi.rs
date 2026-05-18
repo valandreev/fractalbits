@@ -44,6 +44,11 @@ pub const FUSE_ACCESS: u32 = 34;
 pub const FUSE_CREATE: u32 = 35;
 pub const FUSE_INTERRUPT: u32 = 36;
 pub const FUSE_BMAP: u32 = 37;
+// Note: only sent by the kernel for fuseblk and virtiofs mounts (on unmount
+// of the last mount). Plain /dev/fuse mounts never receive FUSE_DESTROY.
+// See linux fs/fuse/inode.c:fuse_send_destroy() and the fc->destroy gate.
+// For fractal-fuse (FUSE-over-io_uring) shutdown is observed as ENOTCONN
+// returned from the ring ops on kernel-side disconnect.
 pub const FUSE_DESTROY: u32 = 38;
 pub const FUSE_IOCTL: u32 = 39;
 pub const FUSE_POLL: u32 = 40;
