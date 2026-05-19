@@ -64,8 +64,8 @@ use crate::mount::{self, MountOptions};
 use crate::ring::*;
 use crate::types::{ReplyInit, Request};
 
-/// Default max_write size (1MB).
-const DEFAULT_MAX_WRITE: u32 = 1024 * 1024;
+/// Hard ceiling for the FUSE write payload size this transport will allocate.
+const MAX_WRITE_SIZE: u32 = 16 * 1024 * 1024;
 
 /// FUSE session managing the lifecycle from mount to shutdown.
 pub struct Session {
@@ -74,7 +74,6 @@ pub struct Session {
     fd: Arc<OwnedFd>,
     queue_depth: u16,
     worker_count: usize,
-    max_write: u32,
     shutdown: CancellationToken,
 }
 
@@ -89,7 +88,6 @@ impl Session {
             fd: Arc::new(fd),
             queue_depth: DEFAULT_QUEUE_DEPTH,
             worker_count: num_possible_cpus(),
-            max_write: DEFAULT_MAX_WRITE,
             shutdown: CancellationToken::new(),
         })
     }
@@ -118,13 +116,6 @@ impl Session {
     /// `num_possible_cpus` internally; setting more is a no-op.
     pub fn with_worker_count(mut self, workers: usize) -> Self {
         self.worker_count = workers;
-        self
-    }
-
-    /// Maximum FUSE write payload (bytes), advertised to the kernel in FUSE_INIT
-    /// (defaults to `DEFAULT_MAX_WRITE` = 1 MiB).
-    pub fn with_max_write(mut self, max_write: u32) -> Self {
-        self.max_write = max_write;
         self
     }
 
@@ -216,10 +207,10 @@ impl Session {
             thread: Some(lifecycle_thread),
         };
 
-        // Cap the FS-requested max_write at the session-configured ceiling
-        // so ring buffer allocation (max_payload below) cannot underflow
-        // what we advertise to the kernel.
-        let max_write = self.max_write.min(reply.max_write);
+        // Cap the FS-requested max_write at the transport ceiling so ring
+        // buffer allocation (max_payload below) cannot underflow what we
+        // advertise to the kernel.
+        let max_write = reply.max_write.min(MAX_WRITE_SIZE);
         write_fuse_init_reply(
             self.fd.as_fd(),
             &parsed,
@@ -603,8 +594,8 @@ fn read_fuse_init(fuse_fd: BorrowedFd<'_>) -> io::Result<ParsedFuseInit> {
 }
 
 /// Send the FUSE_INIT reply: intersect the kernel's capabilities with
-/// what the mount options request, and use the filesystem's [`ReplyInit`]
-/// for `max_write`, readahead, and background tuning.
+/// what the mount options request, and use the negotiated init values for
+/// `max_write`, readahead, and background tuning.
 fn write_fuse_init_reply(
     fuse_fd: BorrowedFd<'_>,
     parsed: &ParsedFuseInit,

@@ -80,8 +80,9 @@ a compio single-threaded runtime. This matches the kernel's fuse-uring model
 every kernel qid.
 
 Ring entries use page-aligned `mmap` buffers for the header (288 bytes) and
-payload (up to `max_write` bytes, default 1MB). The kernel fills request data
-directly into these buffers, and responses are written back in-place.
+payload (up to the filesystem's `max_write`, default 1MB, capped at 16MB by the
+session transport). The kernel fills request data directly into these buffers,
+and responses are written back in-place.
 
 ## Filesystem Trait
 
