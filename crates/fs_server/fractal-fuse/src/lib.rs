@@ -14,5 +14,5 @@ pub use filesystem::{Filesystem, FsResult};
 pub use mount::MountOptions;
 pub use notify::FuseNotifier;
 pub use ring::DEFAULT_QUEUE_DEPTH;
-pub use session::Session;
+pub use session::{Session, SessionShutdownHandle};
 pub use types::*;

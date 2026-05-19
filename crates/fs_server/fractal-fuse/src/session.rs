@@ -67,6 +67,24 @@ use crate::types::{ReplyInit, Request};
 /// Hard ceiling for the FUSE write payload size this transport will allocate.
 const MAX_WRITE_SIZE: u32 = 16 * 1024 * 1024;
 
+/// Clonable handle used to request graceful shutdown of a running session.
+#[derive(Clone, Debug)]
+pub struct SessionShutdownHandle {
+    token: CancellationToken,
+}
+
+impl SessionShutdownHandle {
+    /// Request [`Session::run`] to stop after in-flight requests complete.
+    pub fn shutdown(&self) {
+        self.token.cancel();
+    }
+
+    /// Returns true after shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 /// FUSE session managing the lifecycle from mount to shutdown.
 pub struct Session {
     mount_path: PathBuf,
@@ -92,10 +110,11 @@ impl Session {
         })
     }
 
-    /// Token to signal [`Session::run`](crate::Session::run) to terminate after in-flight
-    /// requests are completed
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.clone()
+    /// Returns a handle that can request graceful session shutdown.
+    pub fn shutdown_handle(&self) -> SessionShutdownHandle {
+        SessionShutdownHandle {
+            token: self.shutdown.clone(),
+        }
     }
 
     /// Number of io_uring entries per queue (defaults to `DEFAULT_QUEUE_DEPTH` = 256).
