@@ -62,15 +62,21 @@ fn main() -> std::io::Result<()> {
 ## Architecture
 
 ```text
-Session::run()
+Session::new(mount_path, mount_options)
   |
   +-- fusermount3 (mount, receive /dev/fuse fd)
+
+Session::run(fs)
+  |
   +-- FUSE_INIT handshake (blocking read/write on /dev/fuse)
+  +-- Filesystem::init(req, Arc<OwnedFd>)  (FS may build a FuseNotifier here)
   +-- one worker thread per CPU (each with compio Runtime + thread affinity)
-        |
-        +-- RingEntry buffers (page-aligned, mmap'd)
-        +-- FuseRegister (register buffers with kernel)
-        +-- Loop: dispatch request -> FuseCommitAndFetch (respond + fetch next)
+  |     |
+  |     +-- RingEntry buffers (page-aligned, mmap'd)
+  |     +-- FuseRegister (register buffers with kernel)
+  |     +-- Loop: dispatch request -> FuseCommitAndFetch (respond + fetch next)
+  |
+  +-- Filesystem::destroy()  (after all workers stop)
 ```
 
 By default, one worker thread runs per CPU, each pinned to its own core with
@@ -139,4 +145,4 @@ for method signatures and semantics.
 
 ## License
 
-Licensed under [Apache License, Version 2.0](LICENSE).
+Licensed under [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).

@@ -4,6 +4,61 @@ All notable changes to `fractal-fuse` will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-19
+
+### Added
+- `SessionShutdownHandle`: a cloneable handle returned from
+  `Session::shutdown_handle()` that lets external code trigger a
+  clean shutdown of the FUSE loop and query whether shutdown has
+  been requested. Re-exported from the crate root.
+- `Session::with_worker_count(n)`: collapse the per-CPU worker
+  topology onto `n` threads while still covering every kernel qid.
+  One worker per CPU remains the default.
+- `Filesystem` handlers for extended attributes (`getxattr`,
+  `setxattr`, `listxattr`, `removexattr`) and file locking
+  (`getlk`, `setlk` for POSIX advisory locks, `flock` for BSD
+  flock-style locks). Unimplemented operations still default to
+  `ENOSYS`.
+- `Filesystem::init` and `Filesystem::destroy` are now actually
+  driven by the session lifecycle: `init` runs after the FUSE_INIT
+  handshake and before any worker dispatches a request, and `destroy`
+  runs once during session teardown after all workers have stopped.
+  Previously the trait methods existed but were not wired up.
+
+### Changed
+- **Breaking:** `Filesystem::init` now takes an additional
+  `fuse_dev_fd: Arc<OwnedFd>` argument carrying a shared, owning
+  handle to the `/dev/fuse` fd. Filesystem implementations that
+  want to send kernel notifications hold on to this and turn it
+  into a `FuseNotifier` via `.into()`.
+- **Breaking:** `FuseNotifier::new(RawFd)` has been removed.
+  Construct a notifier via `FuseNotifier::from(arc_fd)` /
+  `arc_fd.into()` using the `Arc<OwnedFd>` handed to
+  `Filesystem::init`. The notifier now shares ownership of the
+  `/dev/fuse` fd through `Arc<OwnedFd>` instead of borrowing a
+  raw fd, so the fd stays open for as long as any clone exists.
+- The filesystem is mounted inside `Session::new` (previously the
+  caller mounted separately and constructed the session from a raw
+  fd). The `Session` value is now the single owner of the mount + fd.
+- The negotiated FUSE `max_write` (driven by the filesystem's init
+  reply) is now capped at 16 MiB inside the session transport to
+  bound per-ring payload buffer allocation.
+- Internal cancel/disconnect handling has been factored into a
+  shared path so worker shutdown, external unmount, and explicit
+  shutdown via `SessionShutdownHandle` all funnel through the same
+  teardown logic.
+
+### Fixed
+- Sessions now shut down gracefully when the filesystem is
+  externally unmounted (e.g. `fusermount3 -u` from another process)
+  instead of hanging on the next ring submission.
+- `Filesystem::destroy` is now actually invoked during session
+  teardown -- previously it could be skipped on certain shutdown
+  paths.
+- Entry-task failures are now observed in completion order, so the
+  first failing worker reports its error rather than being masked
+  by later workers' shutdown notifications.
+
 ## [0.3.1] - 2026-04-08
 
 ### Added
