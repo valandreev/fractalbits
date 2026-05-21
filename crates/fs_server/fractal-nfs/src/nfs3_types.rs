@@ -3,7 +3,7 @@ use bytes::Bytes;
 
 use crate::xdr::{XdrError, XdrReader, XdrWriter};
 
-// ── Status Codes ──
+// ---------- Status Codes ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -45,7 +45,7 @@ impl Nfsstat3 {
     }
 }
 
-// ── File Types ──
+// ---------- File Types ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -74,7 +74,7 @@ impl Ftype3 {
     }
 }
 
-// ── File Handle ──
+// ---------- File Handle ----------
 
 /// NFS file handle: 16 bytes = ino (u64) + fsid (u64).
 pub const NFS_FH_SIZE: usize = 16;
@@ -122,7 +122,7 @@ impl NfsFh3 {
     }
 }
 
-// ── Time ──
+// ---------- Time ----------
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Nfstime3 {
@@ -155,7 +155,7 @@ impl Nfstime3 {
     }
 }
 
-// ── File Attributes ──
+// ---------- File Attributes ----------
 
 #[derive(Debug, Clone)]
 pub struct Fattr3 {
@@ -218,7 +218,7 @@ pub fn encode_post_op_fh(w: &mut XdrWriter, fh: Option<&NfsFh3>) {
     }
 }
 
-// ── Specdata (rdev) ──
+// ---------- Specdata (rdev) ----------
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Specdata3 {
@@ -233,7 +233,7 @@ impl Specdata3 {
     }
 }
 
-// ── Set Attribute Types ──
+// ---------- Set Attribute Types ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -313,7 +313,7 @@ impl Sattr3 {
     }
 }
 
-// ── WCC (Weak Cache Consistency) ──
+// ---------- WCC (Weak Cache Consistency) ----------
 
 /// Pre-op attributes for WCC.
 #[derive(Debug, Clone)]
@@ -343,7 +343,7 @@ pub fn encode_wcc_data(w: &mut XdrWriter, pre: Option<&WccAttr>, post: Option<&F
     encode_post_op_attr(w, post);
 }
 
-// ── NFS Access Bits ──
+// ---------- NFS Access Bits ----------
 
 pub const ACCESS3_READ: u32 = 0x0001;
 pub const ACCESS3_LOOKUP: u32 = 0x0002;
@@ -352,14 +352,14 @@ pub const ACCESS3_EXTEND: u32 = 0x0008;
 pub const ACCESS3_DELETE: u32 = 0x0010;
 pub const ACCESS3_EXECUTE: u32 = 0x0020;
 
-// ── FSINFO Constants ──
+// ---------- FSINFO Constants ----------
 
 pub const FSF3_LINK: u32 = 0x0001;
 pub const FSF3_SYMLINK: u32 = 0x0002;
 pub const FSF3_HOMOGENEOUS: u32 = 0x0008;
 pub const FSF3_CANSETTIME: u32 = 0x0010;
 
-// ── Create Mode ──
+// ---------- Create Mode ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -379,7 +379,31 @@ impl Createmode3 {
     }
 }
 
-// ── Stable Write ──
+// ---------- Create How ----------
+
+/// Tagged-union body of CREATE3args.how (RFC 1813 3.3.8).
+///
+/// `Unchecked` / `Guarded` carry the requested initial attributes;
+/// `Exclusive` carries an 8-byte verifier so the server can detect
+/// duplicate retries idempotently.
+#[derive(Debug, Clone)]
+pub enum CreateHow3 {
+    Unchecked(Sattr3),
+    Guarded(Sattr3),
+    Exclusive([u8; 8]),
+}
+
+impl CreateHow3 {
+    pub fn mode(&self) -> Createmode3 {
+        match self {
+            CreateHow3::Unchecked(_) => Createmode3::Unchecked,
+            CreateHow3::Guarded(_) => Createmode3::Guarded,
+            CreateHow3::Exclusive(_) => Createmode3::Exclusive,
+        }
+    }
+}
+
+// ---------- Stable Write ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -389,7 +413,7 @@ pub enum StableHow {
     FileSync = 2,
 }
 
-// ── Directory Entry Types ──
+// ---------- Directory Entry Types ----------
 
 #[derive(Debug, Clone)]
 pub struct Entry3 {

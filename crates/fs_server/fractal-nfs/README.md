@@ -43,48 +43,20 @@ pre-decoded arguments and writes typed responses through helpers.
 Implement `Nfs3Filesystem` and call `run`:
 
 ```rust,no_run
-use fractal_nfs::{
-    Nfs3Filesystem, NfsFh3, NfsResult, NfsServerConfig, Nfsstat3,
-    nfs3_wire, xdr::XdrWriter,
-};
+use fractal_nfs::{Nfs3Filesystem, NfsServerConfig};
 
 struct MyFs;
 
 impl Nfs3Filesystem for MyFs {
-    async fn getattr(&self, _fh: &NfsFh3, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn lookup(&self, _dir: &NfsFh3, _name: &str, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::Noent)
-    }
-    async fn access(&self, _fh: &NfsFh3, _a: u32, _u: u32, _g: u32, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn read(&self, _fh: &NfsFh3, _o: u64, _c: u32, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn readdir(&self, _fh: &NfsFh3, _c: u64, _n: u32, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn readdirplus(&self, _fh: &NfsFh3, _c: u64, _m: u32, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn fsstat(&self, _fh: &NfsFh3, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn fsinfo(&self, _fh: &NfsFh3, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
-    async fn pathconf(&self, _fh: &NfsFh3, _w: &mut XdrWriter) -> NfsResult {
-        Err(Nfsstat3::NotSupp)
-    }
+    // Override only the operations your filesystem implements.
+    // All methods default to a sensible NFS error (NotSupp, Noent, Rofs, ...).
 }
 
 fn main() -> std::io::Result<()> {
     let cfg = NfsServerConfig {
         port: 2049,
         num_threads: 4,
-        fsid: 1,
+        ..Default::default()
     };
     fractal_nfs::run(MyFs, cfg)
 }
@@ -131,41 +103,36 @@ non-`Send` handles.
 
 Implement
 [`Nfs3Filesystem`](https://docs.rs/fractal-nfs/latest/fractal_nfs/trait.Nfs3Filesystem.html)
-for your filesystem. Most methods have a sensible default
-(`Err(Nfsstat3::Rofs)` for write operations, `Err(Nfsstat3::NotSupp)` for
-optional ones, `Err(Nfsstat3::Inval)` for `readlink`), so a read-only
-filesystem only needs to implement the read-side ops.
-
-Operations are split below by category. The "Default" column shows the
-error returned if the method isn't overridden.
-
-### Required (no default)
-
-| Operation | Description |
-|-----------|-------------|
-| `getattr` | Get file attributes |
-| `lookup` | Look up a directory entry by name |
-| `access` | Check access rights |
-| `read` | Read file data |
-| `readdir` | Read directory entries |
-| `readdirplus` | Read directory entries with attributes |
-| `fsstat` | Filesystem space + inode statistics |
-| `fsinfo` | Static filesystem info (block sizes, limits) |
-| `pathconf` | POSIX `pathconf`-style limits |
-
-### Optional (defaults supplied)
+for your filesystem. Every method has a default that returns an NFS
+error, so an empty `impl Nfs3Filesystem for MyFs {}` is legal -- you
+override only what your filesystem actually supports.
 
 | Operation | Default | Description |
 |-----------|---------|-------------|
+| `getattr` | `NotSupp` | Get file attributes |
 | `setattr` | `NotSupp` | Set file attributes |
+| `lookup` | `Noent` | Look up a directory entry by name |
+| `access` | `NotSupp` | Check access rights |
 | `readlink` | `Inval` | Read a symbolic link target |
+| `read` | `NotSupp` | Read file data |
 | `write` | `Rofs` | Write file data |
-| `create` | `Rofs` | Create a regular file |
+| `create` | `Rofs` | Create a regular file (carries `CreateHow3`: attrs or exclusive verifier) |
 | `mkdir` | `Rofs` | Create a directory |
 | `remove` | `Rofs` | Unlink a file |
 | `rmdir` | `Rofs` | Remove an empty directory |
 | `rename` | `Rofs` | Rename a file or directory |
+| `readdir` | `NotSupp` | Read directory entries |
+| `readdirplus` | `NotSupp` | Read directory entries with attributes |
+| `fsstat` | `NotSupp` | Filesystem space + inode statistics |
+| `fsinfo` | `NotSupp` | Static filesystem info (block sizes, limits) |
+| `pathconf` | `NotSupp` | POSIX `pathconf`-style limits |
 | `commit` | `NotSupp` | Commit unstable writes (no-op when writes are FILE_SYNC) |
+
+A practically useful filesystem will at minimum override `getattr`,
+`lookup`, `access`, `fsinfo`, and `pathconf` -- without those, the
+kernel client will fail to mount or fail every operation. Add `read` +
+`readdir` (+ `readdirplus`) for a read-only file tree, then any
+write-side ops you need.
 
 Each method receives an `XdrWriter` and, on success, encodes the OK
 response using helpers from
@@ -180,10 +147,6 @@ for you.
 |---------|---------|----------|-------|
 | `tokio-runtime` | yes | `tokio` (`rt`, `net`, `io-util`) | Per-CPU `current_thread` runtimes + `LocalSet` |
 | `compio-runtime` | no | `compio-runtime`, `compio-net`, `compio-io`, `compio-buf` | Per-CPU compio runtimes; integrates with crates already using compio |
-
-With exactly one runtime feature enabled, `fractal_nfs::run` resolves to
-that backend. With both enabled, callers pick explicitly via
-`fractal_nfs::tokio_server::run` or `fractal_nfs::compio_server::run`.
 
 ## License
 

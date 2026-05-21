@@ -99,7 +99,13 @@ impl Nfs3Filesystem for NfsAdapter {
         Ok(())
     }
 
-    async fn setattr(&self, fh: &NfsFh3, attrs: &Sattr3, w: &mut XdrWriter) -> NfsResult {
+    async fn setattr(
+        &self,
+        fh: &NfsFh3,
+        attrs: &Sattr3,
+        _guard_ctime: Option<Nfstime3>,
+        w: &mut XdrWriter,
+    ) -> NfsResult {
         if let Some(0) = attrs.size {
             // Truncate to zero
             let open_fh = self
@@ -209,7 +215,13 @@ impl Nfs3Filesystem for NfsAdapter {
         Ok(())
     }
 
-    async fn create(&self, dir_fh: &NfsFh3, name: &str, w: &mut XdrWriter) -> NfsResult {
+    async fn create(
+        &self,
+        dir_fh: &NfsFh3,
+        name: &str,
+        _how: &CreateHow3,
+        w: &mut XdrWriter,
+    ) -> NfsResult {
         let (attr, fuse_fh) = self
             .vfs
             .vfs_create(dir_fh.ino(), name)
@@ -223,7 +235,13 @@ impl Nfs3Filesystem for NfsAdapter {
         Ok(())
     }
 
-    async fn mkdir(&self, dir_fh: &NfsFh3, name: &str, w: &mut XdrWriter) -> NfsResult {
+    async fn mkdir(
+        &self,
+        dir_fh: &NfsFh3,
+        name: &str,
+        _attrs: &Sattr3,
+        w: &mut XdrWriter,
+    ) -> NfsResult {
         let attr = self
             .vfs
             .vfs_mkdir(dir_fh.ino(), name)
@@ -273,6 +291,7 @@ impl Nfs3Filesystem for NfsAdapter {
         &self,
         dir_fh: &NfsFh3,
         cookie: u64,
+        _cookieverf: [u8; 8],
         _count: u32,
         w: &mut XdrWriter,
     ) -> NfsResult {
@@ -300,6 +319,8 @@ impl Nfs3Filesystem for NfsAdapter {
         &self,
         dir_fh: &NfsFh3,
         cookie: u64,
+        _cookieverf: [u8; 8],
+        _dircount: u32,
         _maxcount: u32,
         w: &mut XdrWriter,
     ) -> NfsResult {

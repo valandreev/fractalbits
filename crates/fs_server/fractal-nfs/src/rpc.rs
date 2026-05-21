@@ -4,7 +4,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::xdr::{XdrError, XdrReader, XdrWriter};
 
-// ── TCP Record Marking ──
+// ---------- TCP Record Marking ----------
 
 const LAST_FRAGMENT_BIT: u32 = 0x8000_0000;
 
@@ -25,7 +25,7 @@ pub fn write_record_mark(buf: &mut BytesMut, payload_len: u32) {
     buf.put_u32(LAST_FRAGMENT_BIT | payload_len);
 }
 
-// ── RPC Message Types ──
+// ---------- RPC Message Types ----------
 
 pub const RPC_VERSION: u32 = 2;
 pub const MSG_TYPE_CALL: u32 = 0;
@@ -43,7 +43,7 @@ pub const ACCEPT_GARBAGE_ARGS: u32 = 4;
 pub const AUTH_NONE: u32 = 0;
 pub const AUTH_SYS: u32 = 1;
 
-// ── RPC Call Header ──
+// ---------- RPC Call Header ----------
 
 #[derive(Debug, Clone)]
 pub struct RpcCallHeader {
@@ -103,7 +103,7 @@ impl RpcCallHeader {
     }
 }
 
-// ── RPC Reply Encoding ──
+// ---------- RPC Reply Encoding ----------
 
 /// Write a successful RPC reply header.
 pub fn write_reply_accepted(w: &mut XdrWriter, xid: u32) {

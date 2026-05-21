@@ -12,11 +12,15 @@ pub const NFS_PROGRAM: u32 = 100003;
 pub const NFS_VERSION: u32 = 3;
 
 /// Dispatch a single RPC call. Returns the reply as an XdrWriter.
+///
+/// `max_reply_bytes` bounds the per-call reply size we'll preallocate
+/// (currently only consulted by NFSPROC3_READ to clamp `args.count`).
 pub async fn dispatch_rpc<F: Nfs3Filesystem>(
     fs: &Arc<F>,
     header: &RpcCallHeader,
     args_buf: &[u8],
     root_fh: &NfsFh3,
+    max_reply_bytes: usize,
 ) -> XdrWriter {
     // Check RPC version
     if header.rpc_version != rpc::RPC_VERSION {
@@ -36,7 +40,7 @@ pub async fn dispatch_rpc<F: Nfs3Filesystem>(
                 rpc::write_reply_prog_unavail(&mut w, header.xid);
                 return w;
             }
-            dispatch_nfs3(fs, header, args_buf).await
+            dispatch_nfs3(fs, header, args_buf, max_reply_bytes).await
         }
         _ => {
             let mut w = XdrWriter::new();
@@ -50,6 +54,7 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
     fs: &Arc<F>,
     header: &RpcCallHeader,
     args_buf: &[u8],
+    max_reply_bytes: usize,
 ) -> XdrWriter {
     let mut r = XdrReader::new(args_buf);
     let xid = header.xid;
@@ -86,7 +91,10 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             let mut w = XdrWriter::new();
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
-            if let Err(status) = fs.setattr(&args.fh, &args.new_attrs, &mut w).await {
+            if let Err(status) = fs
+                .setattr(&args.fh, &args.new_attrs, args.guard_ctime, &mut w)
+                .await
+            {
                 w.truncate(pos);
                 nfs3_wire::encode_setattr_err(&mut w, status);
             }
@@ -143,10 +151,14 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
                 Ok(a) => a,
                 Err(_) => return garbage_args(xid),
             };
-            let mut w = XdrWriter::with_capacity(args.count as usize + 256);
+            // Clamp count so a malicious or buggy client can't make us
+            // allocate gigabytes per request. The cap matches the
+            // server's max_rpc_fragment_bytes (default 16 MiB).
+            let count = std::cmp::min(args.count as usize, max_reply_bytes) as u32;
+            let mut w = XdrWriter::with_capacity(count as usize + 256);
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
-            if let Err(status) = fs.read(&args.fh, args.offset, args.count, &mut w).await {
+            if let Err(status) = fs.read(&args.fh, args.offset, count, &mut w).await {
                 w.truncate(pos);
                 nfs3_wire::encode_read_err(&mut w, status);
             }
@@ -179,7 +191,7 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             let mut w = XdrWriter::new();
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
-            if let Err(status) = fs.create(&args.dir_fh, &args.name, &mut w).await {
+            if let Err(status) = fs.create(&args.dir_fh, &args.name, &args.how, &mut w).await {
                 w.truncate(pos);
                 nfs3_wire::encode_create_err(&mut w, status);
             }
@@ -194,7 +206,10 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             let mut w = XdrWriter::new();
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
-            if let Err(status) = fs.mkdir(&args.dir_fh, &args.name, &mut w).await {
+            if let Err(status) = fs
+                .mkdir(&args.dir_fh, &args.name, &args.attrs, &mut w)
+                .await
+            {
                 w.truncate(pos);
                 nfs3_wire::encode_mkdir_err(&mut w, status);
             }
@@ -264,7 +279,13 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
             if let Err(status) = fs
-                .readdir(&args.dir_fh, args.cookie, args.count, &mut w)
+                .readdir(
+                    &args.dir_fh,
+                    args.cookie,
+                    args.cookieverf,
+                    args.count,
+                    &mut w,
+                )
                 .await
             {
                 w.truncate(pos);
@@ -282,7 +303,14 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             rpc::write_reply_accepted(&mut w, xid);
             let pos = w.len();
             if let Err(status) = fs
-                .readdirplus(&args.dir_fh, args.cookie, args.maxcount, &mut w)
+                .readdirplus(
+                    &args.dir_fh,
+                    args.cookie,
+                    args.cookieverf,
+                    args.dircount,
+                    args.maxcount,
+                    &mut w,
+                )
                 .await
             {
                 w.truncate(pos);

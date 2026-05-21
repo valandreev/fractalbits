@@ -4,7 +4,7 @@ use bytes::Bytes;
 use crate::nfs3_types::*;
 use crate::xdr::{XdrError, XdrReader, XdrWriter};
 
-// ── Procedure Numbers ──
+// ---------- Procedure Numbers ----------
 
 pub const NFSPROC3_NULL: u32 = 0;
 pub const NFSPROC3_GETATTR: u32 = 1;
@@ -26,7 +26,7 @@ pub const NFSPROC3_FSINFO: u32 = 19;
 pub const NFSPROC3_PATHCONF: u32 = 20;
 pub const NFSPROC3_COMMIT: u32 = 21;
 
-// ── Argument Structures ──
+// ---------- Argument Structures ----------
 
 pub struct GetattrArgs {
     pub fh: NfsFh3,
@@ -43,19 +43,26 @@ impl GetattrArgs {
 pub struct SetattrArgs {
     pub fh: NfsFh3,
     pub new_attrs: Sattr3,
-    // guard is optional; skip for now
+    /// Optional guard ctime: the operation should fail with Nfs3ERR_NOT_SYNC
+    /// if the file's current ctime doesn't match this value.
+    pub guard_ctime: Option<Nfstime3>,
 }
 
 impl SetattrArgs {
     pub fn decode(r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
         let fh = NfsFh3::decode(r)?;
         let new_attrs = Sattr3::decode(r)?;
-        // sattrguard3: bool + optional pre_op_attr
         let has_guard = r.read_bool()?;
-        if has_guard {
-            let _ctime = Nfstime3::decode(r)?;
-        }
-        Ok(Self { fh, new_attrs })
+        let guard_ctime = if has_guard {
+            Some(Nfstime3::decode(r)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            fh,
+            new_attrs,
+            guard_ctime,
+        })
     }
 }
 
@@ -132,6 +139,12 @@ impl WriteArgs {
             _ => StableHow::Unstable,
         };
         let data = r.read_opaque_bytes()?;
+        // RFC 1813 3.3.7: `data` is opaque<count>, so its length must
+        // equal `count`. Reject mismatched calls rather than silently
+        // letting the filesystem use the opaque length.
+        if data.len() as u64 != count as u64 {
+            return Err(XdrError::InvalidArg);
+        }
         Ok(Self {
             fh,
             offset,
@@ -145,8 +158,7 @@ impl WriteArgs {
 pub struct CreateArgs {
     pub dir_fh: NfsFh3,
     pub name: String,
-    pub mode: Createmode3,
-    pub attrs: Option<Sattr3>,
+    pub how: CreateHow3,
 }
 
 impl CreateArgs {
@@ -154,19 +166,17 @@ impl CreateArgs {
         let dir_fh = NfsFh3::decode(r)?;
         let name = r.read_string()?.to_string();
         let mode = Createmode3::from_u32(r.read_u32()?);
-        let attrs = if mode != Createmode3::Exclusive {
-            Some(Sattr3::decode(r)?)
-        } else {
-            // exclusive create: skip 8-byte createverf
-            r.skip(8)?;
-            None
+        let how = match mode {
+            Createmode3::Unchecked => CreateHow3::Unchecked(Sattr3::decode(r)?),
+            Createmode3::Guarded => CreateHow3::Guarded(Sattr3::decode(r)?),
+            Createmode3::Exclusive => {
+                let bytes = r.read_opaque_fixed(8)?;
+                let mut verf = [0u8; 8];
+                verf.copy_from_slice(bytes);
+                CreateHow3::Exclusive(verf)
+            }
         };
-        Ok(Self {
-            dir_fh,
-            name,
-            mode,
-            attrs,
-        })
+        Ok(Self { dir_fh, name, how })
     }
 }
 
@@ -290,7 +300,7 @@ impl CommitArgs {
     }
 }
 
-// ── Result Encoders ──
+// ---------- Result Encoders ----------
 
 pub fn encode_getattr_ok(w: &mut XdrWriter, attr: &Fattr3) {
     Nfsstat3::Ok.encode(w);
@@ -553,7 +563,7 @@ pub fn encode_pathconf_ok(w: &mut XdrWriter, attr: &Fattr3, linkmax: u32, name_m
     w.write_u32(name_max);
     w.write_bool(true); // no_trunc
     w.write_bool(false); // chown_restricted
-    w.write_bool(true); // case_insensitive: false (case-sensitive)
+    w.write_bool(false); // case_insensitive (we are case-sensitive)
     w.write_bool(true); // case_preserving
 }
 

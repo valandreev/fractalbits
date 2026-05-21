@@ -19,6 +19,7 @@ bytes = "1.11"
 tracing = "0.1"
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
+tokio-util = "0.7"
 
 # Tokio backend (default).
 tokio = { version = "1.40", features = ["rt", "net", "io-util"], optional = true }

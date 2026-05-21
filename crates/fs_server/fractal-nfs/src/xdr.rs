@@ -190,6 +190,9 @@ pub fn pad4(n: usize) -> usize {
 pub enum XdrError {
     Underflow,
     InvalidUtf8,
+    /// A decoded value violates a protocol invariant (e.g. WRITE3args
+    /// `count` not matching the opaque data length).
+    InvalidArg,
 }
 
 impl std::fmt::Display for XdrError {
@@ -197,6 +200,7 @@ impl std::fmt::Display for XdrError {
         match self {
             XdrError::Underflow => write!(f, "XDR buffer underflow"),
             XdrError::InvalidUtf8 => write!(f, "XDR invalid UTF-8 string"),
+            XdrError::InvalidArg => write!(f, "XDR decoded value violates protocol invariant"),
         }
     }
 }
