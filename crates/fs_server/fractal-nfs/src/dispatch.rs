@@ -123,6 +123,21 @@ async fn dispatch_nfs3<F: Nfs3Filesystem>(
             w
         }
 
+        NFSPROC3_READLINK => {
+            let args = match ReadlinkArgs::decode(&mut r) {
+                Ok(a) => a,
+                Err(_) => return garbage_args(xid),
+            };
+            let mut w = XdrWriter::new();
+            rpc::write_reply_accepted(&mut w, xid);
+            let pos = w.len();
+            if let Err(status) = fs.readlink(&args.fh, &mut w).await {
+                w.truncate(pos);
+                nfs3_wire::encode_readlink_err(&mut w, status);
+            }
+            w
+        }
+
         NFSPROC3_READ => {
             let args = match ReadArgs::decode(&mut r) {
                 Ok(a) => a,

@@ -11,6 +11,7 @@ pub const NFSPROC3_GETATTR: u32 = 1;
 pub const NFSPROC3_SETATTR: u32 = 2;
 pub const NFSPROC3_LOOKUP: u32 = 3;
 pub const NFSPROC3_ACCESS: u32 = 4;
+pub const NFSPROC3_READLINK: u32 = 5;
 pub const NFSPROC3_READ: u32 = 6;
 pub const NFSPROC3_WRITE: u32 = 7;
 pub const NFSPROC3_CREATE: u32 = 8;
@@ -81,6 +82,18 @@ impl AccessArgs {
         let fh = NfsFh3::decode(r)?;
         let access = r.read_u32()?;
         Ok(Self { fh, access })
+    }
+}
+
+pub struct ReadlinkArgs {
+    pub fh: NfsFh3,
+}
+
+impl ReadlinkArgs {
+    pub fn decode(r: &mut XdrReader<'_>) -> Result<Self, XdrError> {
+        Ok(Self {
+            fh: NfsFh3::decode(r)?,
+        })
     }
 }
 
@@ -317,6 +330,17 @@ pub fn encode_access_ok(w: &mut XdrWriter, attr: &Fattr3, access: u32) {
 }
 
 pub fn encode_access_err(w: &mut XdrWriter, status: Nfsstat3) {
+    status.encode(w);
+    encode_post_op_attr(w, None);
+}
+
+pub fn encode_readlink_ok(w: &mut XdrWriter, attr: Option<&Fattr3>, path: &str) {
+    Nfsstat3::Ok.encode(w);
+    encode_post_op_attr(w, attr);
+    w.write_string(path);
+}
+
+pub fn encode_readlink_err(w: &mut XdrWriter, status: Nfsstat3) {
     status.encode(w);
     encode_post_op_attr(w, None);
 }

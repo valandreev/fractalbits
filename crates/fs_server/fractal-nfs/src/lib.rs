@@ -59,6 +59,15 @@ pub trait Nfs3Filesystem: Send + Sync + 'static {
         w: &mut xdr::XdrWriter,
     ) -> impl std::future::Future<Output = NfsResult>;
 
+    fn readlink(
+        &self,
+        fh: &NfsFh3,
+        w: &mut xdr::XdrWriter,
+    ) -> impl std::future::Future<Output = NfsResult> {
+        let _ = (fh, w);
+        async { Err(Nfsstat3::Inval) }
+    }
+
     fn read(
         &self,
         fh: &NfsFh3,
