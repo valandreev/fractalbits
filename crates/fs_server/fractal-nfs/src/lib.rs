@@ -1,13 +1,27 @@
+#![doc = include_str!("../README.md")]
+
+pub mod config;
 pub mod dispatch;
 pub mod mount;
 pub mod nfs3_types;
 pub mod nfs3_wire;
 pub mod rpc;
-pub mod server;
 pub mod xdr;
 
+#[cfg(feature = "compio-runtime")]
+pub mod compio_server;
+#[cfg(feature = "tokio-runtime")]
+pub mod tokio_server;
+
+pub use config::NfsServerConfig;
 pub use nfs3_types::*;
-pub use server::{NfsServerConfig, run};
+
+/// Re-export `run` when exactly one backend is enabled. With both enabled,
+/// callers select explicitly via `compio_server::run` / `tokio_server::run`.
+#[cfg(all(feature = "compio-runtime", not(feature = "tokio-runtime")))]
+pub use compio_server::run;
+#[cfg(all(feature = "tokio-runtime", not(feature = "compio-runtime")))]
+pub use tokio_server::run;
 
 /// Result type for NFS operations: Ok(()) means the success response was
 /// already encoded into the XdrWriter; Err(status) is encoded by the

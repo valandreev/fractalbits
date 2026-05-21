@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 fractal-fuse = { path = "fractal-fuse" }
-fractal-nfs = { path = "fractal-nfs" }
+fractal-nfs = { path = "fractal-nfs", default-features = false, features = ["compio-runtime"] }
 compio-runtime.workspace = true
 compio-net.workspace = true
 compio-io.workspace = true
