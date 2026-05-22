@@ -69,7 +69,7 @@ Session::new(mount_path, mount_options)
 Session::run(fs)
   |
   +-- FUSE_INIT handshake (blocking read/write on /dev/fuse)
-  +-- Filesystem::init(req, Arc<OwnedFd>)  (FS may build a FuseNotifier here)
+  +-- Filesystem::init(req)
   +-- one worker thread per CPU (each with compio Runtime + thread affinity)
   |     |
   |     +-- RingEntry buffers (page-aligned, mmap'd)

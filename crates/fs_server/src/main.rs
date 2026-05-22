@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::{Config, ServerMode};
+use crate::fuse_server::FuseServer;
+use crate::vfs::VfsCore;
 
 #[derive(Parser)]
 #[clap(name = "fs_server", about = "FUSE/NFS file server for FractalBits S3")]
@@ -93,17 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_config = Arc::new(backend_config);
 
     let inodes = Arc::new(inode::InodeTable::new());
-    let vfs_core = Arc::new(vfs::VfsCore::new(
-        backend_config.clone(),
-        inodes,
-        read_write,
-    ));
+    let vfs_core = VfsCore::new(backend_config.clone(), inodes, read_write);
 
     match server_mode {
         ServerMode::Fuse => {
             tracing::info!(mount_point = %mount_point, "Starting FUSE client");
-
-            let fuse_fs = fuse_server::FuseServer::new(vfs_core);
 
             let mount_options = MountOptions::default()
                 .fs_name("fractalbits")
@@ -112,14 +108,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .write_back(read_write && !cfg.passthrough_enabled)
                 .passthrough(cfg.passthrough_enabled);
 
-            Session::new(mount_point.into(), mount_options)?
-                .with_worker_count(cfg.worker_threads)
-                .run(fuse_fs)?;
+            let session = Session::new(mount_point.into(), mount_options)?
+                .with_worker_count(cfg.worker_threads);
+            let vfs_core = Arc::new(vfs_core.with_fuse_fd(session.fuse_fd()));
+            session.run(FuseServer::new(vfs_core))?;
             tracing::info!("FUSE server exited");
         }
         ServerMode::Nfs => {
             tracing::info!(port = cfg.nfs_port, "Starting NFS server");
-            let nfs_adapter = nfs_server::NfsAdapter::new(vfs_core, 1);
+            let nfs_adapter = nfs_server::NfsAdapter::new(Arc::new(vfs_core), 1);
 
             let nfs_config = fractal_nfs::NfsServerConfig {
                 port: cfg.nfs_port,

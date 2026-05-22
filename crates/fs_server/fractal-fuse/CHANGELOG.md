@@ -4,6 +4,22 @@ All notable changes to `fractal-fuse` will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- `Session::fuse_fd()`: returns a cloned `Arc<OwnedFd>` of the kernel
+  `/dev/fuse` fd backing the session. Use it to build a
+  [`FuseNotifier`] (e.g. `FuseNotifier::from(session.fuse_fd())`)
+  or perform raw FUSE-fd operations before calling `Session::run`.
+
+### Changed
+- **Breaking:** `Filesystem::init` no longer takes the
+  `fuse_dev_fd: Arc<OwnedFd>` parameter introduced in 0.4.0. The init
+  hook is now just `init(&self, req: Request) -> FsResult<ReplyInit>`.
+  Filesystem implementations that need the fd should obtain it from
+  `Session::fuse_fd()` after `Session::new` and thread it into the
+  filesystem before calling `Session::run`. This keeps `Filesystem`
+  agnostic of the transport fd and lets the notifier be constructed
+  anywhere in user code, not only inside `init`.
+
 ## [0.4.0] - 2026-05-19
 
 ### Added

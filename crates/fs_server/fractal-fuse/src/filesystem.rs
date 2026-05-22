@@ -1,6 +1,4 @@
 use std::ffi::OsStr;
-use std::os::fd::OwnedFd;
-use std::sync::Arc;
 
 use crate::types::*;
 
@@ -15,19 +13,18 @@ pub type FsResult<T> = std::result::Result<T, Errno>;
 pub trait Filesystem: Send + Sync + 'static {
     /// Initialize the filesystem.
     ///
-    /// Called once during mount before any other operations. `fuse_dev_fd`
-    /// is a shared handle to the kernel `/dev/fuse` connection this session
-    /// is bound to. Store it (clone the `Arc`) if the implementation needs
-    /// the raw fd for passthrough ioctls or wants to construct a
-    /// [`FuseNotifier`](crate::FuseNotifier) for sending unsolicited
-    /// notifications. Returns [`ReplyInit`] containing `max_write` size and
-    /// capability hints that the kernel negotiates with the FUSE client.
-    fn init(
-        &self,
-        req: Request,
-        fuse_dev_fd: Arc<OwnedFd>,
-    ) -> impl std::future::Future<Output = FsResult<ReplyInit>> {
-        let _ = (req, fuse_dev_fd);
+    /// Called once during mount before any other operations. Returns
+    /// [`ReplyInit`] containing `max_write` size and capability hints that
+    /// the kernel negotiates with the FUSE client.
+    ///
+    /// If the implementation needs the raw `/dev/fuse` fd (for passthrough
+    /// ioctls or to build a [`FuseNotifier`](crate::FuseNotifier) for
+    /// sending unsolicited notifications), obtain it from
+    /// [`Session::fuse_fd`](crate::Session::fuse_fd) before calling
+    /// [`Session::run`](crate::Session::run) and thread it into the
+    /// filesystem there.
+    fn init(&self, req: Request) -> impl std::future::Future<Output = FsResult<ReplyInit>> {
+        let _ = req;
         async { Ok(ReplyInit::default()) }
     }
 

@@ -117,6 +117,20 @@ impl Session {
         }
     }
 
+    /// Returns a shared owning handle to the kernel `/dev/fuse` fd backing
+    /// this session.
+    ///
+    /// Use this to construct a [`FuseNotifier`](crate::FuseNotifier) (e.g.
+    /// `FuseNotifier::from(session.fuse_fd())`) or perform raw FUSE-fd
+    /// operations (e.g. passthrough ioctls) outside of the [`Filesystem`]
+    /// trait. The returned `Arc` keeps the fd open for as long as any
+    /// clone exists, so notifiers remain usable across the full lifetime
+    /// of the mount even after the `Session` is consumed by
+    /// [`Session::run`].
+    pub fn fuse_fd(&self) -> Arc<OwnedFd> {
+        self.fd.clone()
+    }
+
     /// Number of io_uring entries per queue (defaults to `DEFAULT_QUEUE_DEPTH` = 256).
     pub fn with_queue_depth(mut self, depth: u16) -> Self {
         self.queue_depth = depth;
@@ -172,7 +186,6 @@ impl Session {
         let (init_tx, init_rx) = mpsc::sync_channel::<FsResult<ReplyInit>>(1);
         let lifecycle_fs = fs.clone();
         let lifecycle_destroy = destroy_signal.clone();
-        let fuse_dev_fd = self.fd.clone();
         let lifecycle_thread = thread::Builder::new()
             .name("fuse-lifecycle".to_string())
             .spawn(move || -> io::Result<()> {
@@ -181,7 +194,7 @@ impl Session {
                     e
                 })?;
                 rt.block_on(async {
-                    match lifecycle_fs.init(init_request, fuse_dev_fd).await {
+                    match lifecycle_fs.init(init_request).await {
                         Ok(reply) => {
                             // Send reply before awaiting destroy so the
                             // main thread can resume mount setup while

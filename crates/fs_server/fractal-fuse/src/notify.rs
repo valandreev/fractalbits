@@ -14,8 +14,9 @@ use crate::abi::{
 /// page-cache ranges when underlying data changes outside the kernel's
 /// view. Shares ownership of the `/dev/fuse` fd via `Arc<OwnedFd>`, so the
 /// fd stays open for as long as any clone exists. Construct one from the
-/// `Arc<OwnedFd>` handed to
-/// [`Filesystem::init`](crate::Filesystem::init) via `.into()`.
+/// `Arc<OwnedFd>` returned by
+/// [`Session::fuse_fd`](crate::Session::fuse_fd), e.g.
+/// `FuseNotifier::from(session.fuse_fd())`.
 #[derive(Clone)]
 pub struct FuseNotifier {
     fuse_dev_fd: Arc<OwnedFd>,
