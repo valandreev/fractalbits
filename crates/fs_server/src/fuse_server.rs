@@ -2,8 +2,8 @@ use fractal_fuse::*;
 use std::ffi::OsStr;
 use std::sync::Arc;
 
-use crate::error::FsError;
-use crate::vfs::{TTL, VfsAttr, VfsCore};
+use fractal_vfs::error::FsError;
+use fractal_vfs::vfs::{TTL, VfsAttr, VfsCore};
 
 pub struct FuseServer {
     vfs: Arc<VfsCore>,

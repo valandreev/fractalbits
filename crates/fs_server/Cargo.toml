@@ -9,45 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 fractal-fuse = { path = "fractal-fuse" }
-fractal-nfs = { path = "fractal-nfs", default-features = false, features = ["compio-runtime"] }
-compio-runtime.workspace = true
-compio-net.workspace = true
-compio-io.workspace = true
-compio-buf.workspace = true
-compio-fs.workspace = true
+fractal-vfs = { path = "../fractal-vfs" }
 
-rpc_client_common = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_bss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_nss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-rpc_client_rss = { workspace = true, default-features = false, features = ["compio-runtime"] }
-volume_group_proxy = { workspace = true, default-features = false, features = ["compio-runtime"] }
-
-nss_codec.workspace = true
-file_ops.workspace = true
-rss_codec.workspace = true
-bss_codec.workspace = true
-rpc_codec_common.workspace = true
-data_types.workspace = true
-metrics_wrapper.workspace = true
-
-prost.workspace = true
-bytes.workspace = true
+clap.workspace = true
+config.workspace = true
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
-clap.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-rkyv.workspace = true
-moka = { workspace = true, features = ["sync"] }
-dashmap.workspace = true
-uuid.workspace = true
-config.workspace = true
-rand.workspace = true
-xxhash-rust.workspace = true
-lru.workspace = true
+compio-runtime.workspace = true
 libc.workspace = true
-nix.workspace = true
-
-[dev-dependencies]
-compio-macros.workspace = true

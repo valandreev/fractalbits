@@ -1,13 +1,6 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ServerMode {
-    #[default]
-    Fuse,
-    Nfs,
-}
-
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub rss_addrs: Vec<String>,

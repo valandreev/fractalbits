@@ -1,13 +1,4 @@
-mod backend;
-mod cache;
-mod config;
-mod disk_cache;
-mod error;
 mod fuse_server;
-mod inode;
-mod nfs_server;
-mod slice_mut;
-mod vfs;
 
 use clap::Parser;
 use fractal_fuse::MountOptions;
@@ -17,22 +8,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::config::{Config, ServerMode};
+use fractal_vfs::backend;
+use fractal_vfs::config::Config;
+use fractal_vfs::inode;
+use fractal_vfs::vfs::VfsCore;
+
 use crate::fuse_server::FuseServer;
-use crate::vfs::VfsCore;
 
 #[derive(Parser)]
-#[clap(name = "fs_server", about = "FUSE/NFS file server for FractalBits S3")]
+#[clap(name = "fs_server", about = "FUSE file server for FractalBits S3")]
 struct Opt {
     #[clap(short = 'c', long = "config", help = "Config file path")]
     config_file: Option<PathBuf>,
-
-    #[clap(
-        long = "mode",
-        default_value = "fuse",
-        help = "Server mode: fuse or nfs"
-    )]
-    mode: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -58,12 +45,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let opt = Opt::parse();
-    let mode_str = std::env::var("FS_SERVER_MODE").unwrap_or(opt.mode);
-    let server_mode = match mode_str.as_str() {
-        "nfs" => ServerMode::Nfs,
-        _ => ServerMode::Fuse,
-    };
-
     let mut cfg: Config = match opt.config_file {
         Some(config_file) => ::config::Config::builder()
             .add_source(::config::File::from(config_file).required(true))
@@ -78,13 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(
         bucket = %cfg.bucket_name,
-        mode = ?server_mode,
         read_write = read_write,
         "Starting fs_server"
     );
 
     // Discover backend configuration (NSS address, DataVgInfo, bucket) via RSS.
-    // This runs on a temporary compio runtime since we need async RPC.
     let backend_config = {
         let cfg_ref = &cfg;
         compio_runtime::Runtime::new()
@@ -95,38 +74,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_config = Arc::new(backend_config);
 
     let inodes = Arc::new(inode::InodeTable::new());
-    let vfs_core = VfsCore::new(backend_config.clone(), inodes, read_write);
+    let vfs_core = VfsCore::new(backend_config, inodes, read_write);
 
-    match server_mode {
-        ServerMode::Fuse => {
-            tracing::info!(mount_point = %mount_point, "Starting FUSE client");
+    tracing::info!(mount_point = %mount_point, "Starting FUSE client");
 
-            let mount_options = MountOptions::default()
-                .fs_name("fractalbits")
-                .read_only(!read_write)
-                .allow_other(cfg.allow_other)
-                .write_back(read_write && !cfg.passthrough_enabled)
-                .passthrough(cfg.passthrough_enabled);
+    let mount_options = MountOptions::default()
+        .fs_name("fractalbits")
+        .read_only(!read_write)
+        .allow_other(cfg.allow_other)
+        .write_back(read_write && !cfg.passthrough_enabled)
+        .passthrough(cfg.passthrough_enabled);
 
-            let session = Session::new(mount_point.into(), mount_options)?
-                .with_worker_count(cfg.worker_threads);
-            let vfs_core = Arc::new(vfs_core.with_fuse_fd(session.fuse_fd()));
-            session.run(FuseServer::new(vfs_core))?;
-            tracing::info!("FUSE server exited");
-        }
-        ServerMode::Nfs => {
-            tracing::info!(port = cfg.nfs_port, "Starting NFS server");
-            let nfs_adapter = nfs_server::NfsAdapter::new(Arc::new(vfs_core), 1);
-
-            let nfs_config = fractal_nfs::NfsServerConfig {
-                port: cfg.nfs_port,
-                ..Default::default()
-            };
-
-            fractal_nfs::run(nfs_adapter, nfs_config)?;
-            tracing::info!("NFS server exited");
-        }
-    }
+    let session =
+        Session::new(mount_point.into(), mount_options)?.with_worker_count(cfg.worker_threads);
+    let vfs_core = Arc::new(vfs_core.with_fuse_fd(session.fuse_fd()));
+    session.run(FuseServer::new(vfs_core))?;
+    tracing::info!("FUSE server exited");
 
     Ok(())
 }
