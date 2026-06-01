@@ -503,7 +503,19 @@ async fn run_entry<F: Filesystem>(
 
     // Process requests in a loop: dispatch -> commit response + fetch next
     loop {
-        let needs_response = dispatch::dispatch(fs, entry).await;
+        let (needs_response, panic_result) = dispatch::dispatch(fs, entry).await;
+
+        if let Err(e) = panic_result {
+            if let Some(msg) = e
+                .downcast_ref::<String>()
+                .map(|x| &**x)
+                .or_else(|| e.downcast_ref::<&str>().copied())
+            {
+                error!("filesystem op panicked: {}", msg);
+            } else {
+                error!("filesystem op panicked");
+            }
+        }
 
         if needs_response.is_none() {
             // FORGET-type op: re-register without sending a response

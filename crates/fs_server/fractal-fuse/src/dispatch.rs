@@ -1,6 +1,9 @@
+use std::any::Any;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::panic::{self, AssertUnwindSafe};
 
+use futures_util::FutureExt;
 use tracing::{debug, warn};
 
 use crate::abi::*;
@@ -11,7 +14,10 @@ use crate::types::*;
 /// Dispatch a FUSE request to the filesystem and return the response.
 /// Returns the serialized response length written to the entry's header/payload,
 /// or None if no response should be sent (e.g., FORGET).
-pub async fn dispatch<F: Filesystem>(fs: &F, entry: &mut RingEntry) -> Option<()> {
+pub async fn dispatch<F: Filesystem>(
+    fs: &F,
+    entry: &mut RingEntry,
+) -> (Option<()>, Result<(), Box<dyn Any + Send>>) {
     let header = entry.header();
     let in_hdr = header.in_header();
     let opcode = in_hdr.opcode;
@@ -28,8 +34,9 @@ pub async fn dispatch<F: Filesystem>(fs: &F, entry: &mut RingEntry) -> Option<()
     match opcode {
         FUSE_FORGET => {
             let arg: &fuse_forget_in = header.op_in_as();
-            fs.forget(req, nodeid, arg.nlookup);
-            return None;
+            let result =
+                panic::catch_unwind(AssertUnwindSafe(|| fs.forget(req, nodeid, arg.nlookup)));
+            return (None, result);
         }
         FUSE_BATCH_FORGET => {
             let arg: &fuse_batch_forget_in = header.op_in_as();
@@ -45,19 +52,25 @@ pub async fn dispatch<F: Filesystem>(fs: &F, entry: &mut RingEntry) -> Option<()
                 let one = unsafe { &*(payload.as_ptr().add(offset) as *const fuse_forget_one) };
                 inodes.push((one.nodeid, one.nlookup));
             }
-            fs.batch_forget(req, &inodes);
-            return None;
+            let result = panic::catch_unwind(AssertUnwindSafe(|| fs.batch_forget(req, &inodes)));
+            return (None, result);
         }
         _ => {}
     }
 
-    let result = dispatch_with_reply(fs, entry, req, opcode, nodeid).await;
+    let result = AssertUnwindSafe(dispatch_with_reply(fs, entry, req, opcode, nodeid))
+        .catch_unwind()
+        .await;
     debug!(
         "dispatch: opcode={} nodeid={} unique={}",
         opcode, nodeid, unique
     );
-    serialize_response(entry, unique, opcode, result);
-    Some(())
+    let (dispatch_result, panic_result) = match result {
+        Ok(x) => (x, Ok(())),
+        Err(e) => (DispatchResult::Error(EIO), Err(e)),
+    };
+    serialize_response(entry, unique, opcode, dispatch_result);
+    (Some(()), panic_result)
 }
 
 async fn dispatch_with_reply<F: Filesystem>(
