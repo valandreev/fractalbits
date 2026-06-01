@@ -345,7 +345,15 @@ impl Session {
                     }));
 
                     if let Err(e) = result {
-                        error!("worker {} panicked: {:?}", worker_id, e);
+                        if let Some(msg) = e
+                            .downcast_ref::<String>()
+                            .map(|x| &**x)
+                            .or_else(|| e.downcast_ref::<&str>().copied())
+                        {
+                            error!("worker {} panicked: {}", worker_id, msg);
+                        } else {
+                            error!("worker {} panicked", worker_id);
+                        }
                         any_failed.store(true, Ordering::Relaxed);
                         shutdown.cancel();
                     }
@@ -473,7 +481,15 @@ async fn run_worker<F: Filesystem>(
                 shutdown.cancel();
             }
             Err(e) => {
-                error!("entry task panicked: {:?}", e);
+                if let Some(msg) = e
+                    .downcast_ref::<String>()
+                    .map(|x| &**x)
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                {
+                    error!("entry task panicked: {}", msg);
+                } else {
+                    error!("entry task panicked");
+                }
                 failed = true;
                 shutdown.cancel();
             }
