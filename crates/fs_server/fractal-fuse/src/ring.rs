@@ -1,14 +1,11 @@
 use std::io;
-use std::marker::PhantomPinned;
 use std::mem::size_of;
-use std::pin::Pin;
 use std::ptr;
 
 use compio_driver::{OpCode, OpEntry};
 use io_uring::opcode::UringCmd80;
 use io_uring::squeue::Entry128;
 use io_uring::types::Fixed;
-use pin_project_lite::pin_project;
 
 use crate::abi::*;
 
@@ -179,15 +176,11 @@ fn build_cmd(qid: u16, commit_id: u64) -> [u8; 80] {
     cmd
 }
 
-pin_project! {
-    /// FUSE REGISTER operation: registers a ring entry's buffers with the kernel
-    /// and fetches the first request.
-    pub struct FuseRegister {
-        iov_ptr: u64,
-        qid: u16,
-        #[pin]
-        _pin: PhantomPinned,
-    }
+/// FUSE REGISTER operation: registers a ring entry's buffers with the kernel
+/// and fetches the first request.
+pub struct FuseRegister {
+    iov_ptr: u64,
+    qid: u16,
 }
 
 impl FuseRegister {
@@ -195,27 +188,16 @@ impl FuseRegister {
         Self {
             iov_ptr: entry.iov_ptr() as u64,
             qid,
-            _pin: PhantomPinned,
         }
     }
-}
-
-/// Patch the `addr` field (offset 16) in the raw SQE inside an Entry128.
-///
-/// The upstream io-uring crate (0.7.x) does not expose a setter for `sqe.addr`
-/// on `UringCmd80`. The field sits at a fixed kernel-ABI offset (16 bytes into
-/// `io_uring_sqe`), so we write it directly.
-unsafe fn set_sqe_addr(entry: &mut Entry128, addr: u64) {
-    const _: () = assert!(size_of::<Entry128>() == 128);
-    let ptr = entry as *mut Entry128 as *mut u8;
-    unsafe { ptr.add(16).cast::<u64>().write(addr) };
 }
 
 /// Patch the `len` field (offset 24) in the raw SQE inside an Entry128.
 ///
 /// The upstream io-uring crate does not expose a setter for `sqe.len` on
-/// `UringCmd80`. The field sits at a fixed kernel-ABI offset (24 bytes into
-/// `io_uring_sqe`), so we write it directly.
+/// `UringCmd80` (unlike `addr`, which gained a builder in 0.7.12). The field
+/// sits at a fixed kernel-ABI offset (24 bytes into `io_uring_sqe`), so we
+/// write it directly.
 unsafe fn set_sqe_len(entry: &mut Entry128, len: u32) {
     const _: () = assert!(size_of::<Entry128>() == 128);
     let ptr = entry as *mut Entry128 as *mut u8;
@@ -223,48 +205,44 @@ unsafe fn set_sqe_len(entry: &mut Entry128, len: u32) {
 }
 
 unsafe impl OpCode for FuseRegister {
-    fn create_entry(self: Pin<&mut Self>) -> OpEntry {
-        let this = self.project();
-        let cmd = build_cmd(*this.qid, 0);
+    // No self-references are held across the operation; the iovec pointer
+    // refers to externally-owned, pinned `RingEntry` memory.
+    type Control = ();
 
+    fn create_entry(&mut self, _: &mut Self::Control) -> OpEntry {
+        let cmd = build_cmd(self.qid, 0);
+
+        // `addr` carries the iovec pointer; builder setter added in io-uring 0.7.12.
         let mut entry = UringCmd80::new(Fixed(FUSE_FD_INDEX), FUSE_IO_URING_CMD_REGISTER)
             .cmd(cmd)
+            .addr(Some(self.iov_ptr))
             .build();
 
-        // Set iovec pointer — upstream UringCmd80 doesn't expose .addr() yet
-        unsafe { set_sqe_addr(&mut entry, *this.iov_ptr) };
-        // Set iovec count (2) via raw SQE poke — upstream has no .len() setter
+        // Set iovec count (2) via raw SQE poke -- upstream has no .len() setter
         unsafe { set_sqe_len(&mut entry, 2) };
 
         entry.into()
     }
 }
 
-pin_project! {
-    /// FUSE COMMIT_AND_FETCH operation: sends a response to the kernel and
-    /// atomically fetches the next request into the same buffers.
-    pub struct FuseCommitAndFetch {
-        qid: u16,
-        commit_id: u64,
-        #[pin]
-        _pin: PhantomPinned,
-    }
+/// FUSE COMMIT_AND_FETCH operation: sends a response to the kernel and
+/// atomically fetches the next request into the same buffers.
+pub struct FuseCommitAndFetch {
+    qid: u16,
+    commit_id: u64,
 }
 
 impl FuseCommitAndFetch {
     pub fn new(qid: u16, commit_id: u64) -> Self {
-        Self {
-            qid,
-            commit_id,
-            _pin: PhantomPinned,
-        }
+        Self { qid, commit_id }
     }
 }
 
 unsafe impl OpCode for FuseCommitAndFetch {
-    fn create_entry(self: Pin<&mut Self>) -> OpEntry {
-        let this = self.project();
-        let cmd = build_cmd(*this.qid, *this.commit_id);
+    type Control = ();
+
+    fn create_entry(&mut self, _: &mut Self::Control) -> OpEntry {
+        let cmd = build_cmd(self.qid, self.commit_id);
 
         UringCmd80::new(Fixed(FUSE_FD_INDEX), FUSE_IO_URING_CMD_COMMIT_AND_FETCH)
             .cmd(cmd)
