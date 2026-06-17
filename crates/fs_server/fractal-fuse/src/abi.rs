@@ -764,4 +764,12 @@ const _: () = {
     assert!(size_of::<fuse_notify_inval_inode_out>() == 24);
     assert!(size_of::<fuse_notify_inval_entry_out>() == 16);
     assert!(size_of::<fuse_notify_delete_out>() == 24);
+    // Dirent/entry sizes are load-bearing for the readdir(plus) wire format:
+    // the kernel parses names at offsetof(name), which equals size_of here only
+    // because these structs have no trailing padding. Guard that invariant so a
+    // future field/layout change can't silently corrupt the dirent stream.
+    assert!(size_of::<fuse_attr>() == 88);
+    assert!(size_of::<fuse_entry_out>() == 128);
+    assert!(size_of::<fuse_dirent>() == 24);
+    assert!(size_of::<fuse_direntplus>() == 152);
 };
