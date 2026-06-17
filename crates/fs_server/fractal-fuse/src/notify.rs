@@ -38,10 +38,13 @@ impl FuseNotifier {
             flags: 0,
         };
         let header = fuse_out_header {
+            // +1: the kernel requires the name to be NUL-terminated on the wire
+            // (it reads namelen+1 bytes); see write_notify and fs/fuse/dev.c.
             len: (size_of::<fuse_out_header>()
                 + size_of::<fuse_notify_inval_entry_out>()
-                + name.len()) as u32,
-            error: -FUSE_NOTIFY_INVAL_ENTRY,
+                + name.len()
+                + 1) as u32,
+            error: FUSE_NOTIFY_INVAL_ENTRY,
             unique: 0,
         };
         self.write_notify(&header, as_bytes(&notify), name)
@@ -57,7 +60,7 @@ impl FuseNotifier {
         };
         let header = fuse_out_header {
             len: (size_of::<fuse_out_header>() + size_of::<fuse_notify_inval_inode_out>()) as u32,
-            error: -FUSE_NOTIFY_INVAL_INODE,
+            error: FUSE_NOTIFY_INVAL_INODE,
             unique: 0,
         };
         self.write_notify(&header, as_bytes(&notify), &[])
@@ -73,22 +76,31 @@ impl FuseNotifier {
             padding: 0,
         };
         let header = fuse_out_header {
-            len: (size_of::<fuse_out_header>() + size_of::<fuse_notify_delete_out>() + name.len())
-                as u32,
-            error: -FUSE_NOTIFY_DELETE,
+            // +1: the kernel requires the name to be NUL-terminated on the wire
+            // (it reads namelen+1 bytes); see write_notify and fs/fuse/dev.c.
+            len: (size_of::<fuse_out_header>()
+                + size_of::<fuse_notify_delete_out>()
+                + name.len()
+                + 1) as u32,
+            error: FUSE_NOTIFY_DELETE,
             unique: 0,
         };
         self.write_notify(&header, as_bytes(&notify), name)
     }
 
     /// Write a notification message to /dev/fuse using writev.
-    /// The message is: [fuse_out_header] [notify struct] [optional name bytes]
+    /// The message is: [fuse_out_header] [notify struct] [name bytes] [NUL].
+    /// The kernel expects names to be NUL-terminated (it reads namelen+1 bytes
+    /// and stores the terminator), so a trailing NUL is appended whenever a
+    /// name is present. The `namelen` field itself stays the un-terminated
+    /// length. Notifications without a name (e.g. inval_inode) omit both.
     fn write_notify(
         &self,
         header: &fuse_out_header,
         notify_bytes: &[u8],
         name: &[u8],
     ) -> io::Result<()> {
+        const NUL: [u8; 1] = [0];
         let mut iovecs = [
             libc::iovec {
                 iov_base: header as *const _ as *mut _,
@@ -102,8 +114,12 @@ impl FuseNotifier {
                 iov_base: name.as_ptr() as *mut _,
                 iov_len: name.len(),
             },
+            libc::iovec {
+                iov_base: NUL.as_ptr() as *mut _,
+                iov_len: NUL.len(),
+            },
         ];
-        let iov_count = if name.is_empty() { 2 } else { 3 };
+        let iov_count = if name.is_empty() { 2 } else { 4 };
 
         let ret =
             unsafe { libc::writev(self.fuse_dev_fd.as_raw_fd(), iovecs.as_mut_ptr(), iov_count) };
@@ -122,18 +138,4 @@ impl FuseNotifier {
 
 fn as_bytes<T: Sized>(val: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(val as *const T as *const u8, size_of::<T>()) }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn notify_struct_sizes() {
-        // Verify struct sizes match kernel expectations
-        assert_eq!(size_of::<fuse_out_header>(), 16);
-        assert_eq!(size_of::<fuse_notify_inval_inode_out>(), 24);
-        assert_eq!(size_of::<fuse_notify_inval_entry_out>(), 16);
-        assert_eq!(size_of::<fuse_notify_delete_out>(), 24);
-    }
 }

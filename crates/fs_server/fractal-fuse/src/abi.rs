@@ -755,9 +755,13 @@ impl fuse_uring_req_header {
 
 // Size assertions
 const _: () = {
-    assert!(std::mem::size_of::<fuse_in_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
-    assert!(std::mem::size_of::<fuse_out_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
-    assert!(std::mem::size_of::<fuse_uring_req_header>() == 288);
-    assert!(std::mem::size_of::<fuse_uring_cmd_req>() == 24);
-    assert!(std::mem::size_of::<fuse_uring_ent_in_out>() == 32);
+    assert!(size_of::<fuse_in_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+    assert!(size_of::<fuse_out_header>() <= FUSE_URING_IN_OUT_HEADER_SZ);
+    assert!(size_of::<fuse_uring_req_header>() == 288);
+    assert!(size_of::<fuse_uring_cmd_req>() == 24);
+    assert!(size_of::<fuse_uring_ent_in_out>() == 32);
+    // Notify struct sizes must match kernel expectations.
+    assert!(size_of::<fuse_notify_inval_inode_out>() == 24);
+    assert!(size_of::<fuse_notify_inval_entry_out>() == 16);
+    assert!(size_of::<fuse_notify_delete_out>() == 24);
 };
