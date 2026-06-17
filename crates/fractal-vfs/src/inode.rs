@@ -50,6 +50,12 @@ pub struct InodeTable {
     key_to_ino: DashMap<(String, EntryType), u64>,
 }
 
+impl Default for InodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InodeTable {
     pub fn new() -> Self {
         let table = Self {

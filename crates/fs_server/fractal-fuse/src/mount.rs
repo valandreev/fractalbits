@@ -20,20 +20,18 @@ pub fn fusermount(mount_options: &MountOptions, mount_path: &Path) -> io::Result
         SockType::SeqPacket,
         None,
         SockFlag::empty(),
-    )
-    .map_err(io::Error::from)?;
+    )?;
 
     let binary_path = find_fusermount3()?;
 
     let options = build_mount_options(mount_options);
     debug!("mount options {:?}", options);
 
-    let mount_path_os = mount_path.as_os_str().to_os_string();
     let fd0 = sock0.as_raw_fd();
 
     let status = Command::new(binary_path)
         .env("_FUSE_COMMFD", fd0.to_string())
-        .args([OsString::from("-o"), options, mount_path_os])
+        .args([OsString::from("-o"), options, mount_path.into()])
         .status()?;
 
     if !status.success() {
