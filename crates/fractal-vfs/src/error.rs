@@ -13,6 +13,9 @@ pub enum FsError {
     #[error("directory not empty")]
     NotEmpty,
 
+    #[error("file name too long")]
+    NameTooLong,
+
     #[error("is a directory")]
     IsDir,
 
@@ -37,11 +40,20 @@ pub enum FsError {
     #[error("invalid object state")]
     InvalidState,
 
+    #[error("invalid argument")]
+    InvalidArg,
+
+    #[error("no data available at offset (lseek SEEK_DATA past EOF / SEEK_HOLE/DATA beyond end)")]
+    NoData,
+
     #[error("deserialization error: {0}")]
     Deserialize(String),
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("cas conflict: stored value changed under the put_inode_cas guard")]
+    CasConflict,
 }
 
 impl From<FsError> for io::Error {
@@ -50,6 +62,7 @@ impl From<FsError> for io::Error {
             FsError::NotFound => io::Error::from_raw_os_error(libc::ENOENT),
             FsError::AlreadyExists => io::Error::from_raw_os_error(libc::EEXIST),
             FsError::NotEmpty => io::Error::from_raw_os_error(libc::ENOTEMPTY),
+            FsError::NameTooLong => io::Error::from_raw_os_error(libc::ENAMETOOLONG),
             FsError::IsDir => io::Error::from_raw_os_error(libc::EISDIR),
             FsError::NotDir => io::Error::from_raw_os_error(libc::ENOTDIR),
             FsError::ReadOnly => io::Error::from_raw_os_error(libc::EROFS),
@@ -64,8 +77,15 @@ impl From<FsError> for io::Error {
             }
             FsError::DataVg(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::InvalidState => io::Error::from_raw_os_error(libc::EINVAL),
+            FsError::InvalidArg => io::Error::from_raw_os_error(libc::EINVAL),
+            FsError::NoData => io::Error::from_raw_os_error(libc::ENXIO),
             FsError::Deserialize(_) => io::Error::from_raw_os_error(libc::EIO),
             FsError::Internal(_) => io::Error::from_raw_os_error(libc::EIO),
+            // A CAS conflict means the inode was rewritten underneath this
+            // publish (another writer / instance won). The override-flush
+            // path catches this typed variant and forward-retries; if it
+            // ever escapes to the kernel, ESTALE is the honest answer.
+            FsError::CasConflict => io::Error::from_raw_os_error(libc::ESTALE),
         }
     }
 }
@@ -99,6 +119,10 @@ impl From<file_ops::NssError> for FsError {
             file_ops::NssError::AlreadyExists => FsError::AlreadyExists,
             file_ops::NssError::Internal(msg) => FsError::Internal(msg),
             file_ops::NssError::Deserialization(msg) => FsError::Deserialize(msg),
+            // The override flush path uses the typed CasConflict variant to
+            // distinguish a lost CAS race (retry) from a hard failure; the
+            // winning value bytes are dropped here and re-read on retry.
+            file_ops::NssError::CasConflict(_) => FsError::CasConflict,
         }
     }
 }

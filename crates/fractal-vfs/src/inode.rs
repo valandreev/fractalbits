@@ -1,7 +1,8 @@
 use dashmap::DashMap;
-use data_types::object_layout::ObjectLayout;
+use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 pub const ROOT_INODE: u64 = 1;
 
@@ -11,21 +12,104 @@ pub enum EntryType {
     Directory,
 }
 
+/// Pull the embedded `PosixAttrs` out of an `ObjectLayout`. Returns the
+/// zero value for layout shapes that don't carry one (Indirect, or
+/// Mpu(Uploading)) so callers can treat that as the
+/// "uninitialised, fall back to defaults" sentinel.
+pub fn layout_posix(layout: &ObjectLayout) -> PosixAttrs {
+    match &layout.state {
+        ObjectState::Normal(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+        ObjectState::Mpu(data_types::object_layout::MpuState::Completed(core)) => {
+            core.posix.as_deref().copied().unwrap_or_default()
+        }
+        ObjectState::Symlink(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+        ObjectState::Special(data) => data
+            .core_meta_data
+            .posix
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+        ObjectState::Directory(data) => data.posix,
+        _ => PosixAttrs::default(),
+    }
+}
+
+/// Set the embedded `PosixAttrs` of an `ObjectLayout`, returning the
+/// updated layout. No-op for shapes that don't carry posix
+/// (Indirect, Mpu(Uploading)); used by `vfs_setattr_posix`'s
+/// queue-side persistence path so a standalone chmod / chown / utime
+/// against a file with no pending flush still survives a
+/// forget+relookup.
+pub fn layout_with_posix(mut layout: ObjectLayout, new_posix: PosixAttrs) -> ObjectLayout {
+    use data_types::object_layout::MpuState;
+    match &mut layout.state {
+        ObjectState::Normal(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
+        ObjectState::Mpu(MpuState::Completed(core)) => core.posix = Some(Box::new(new_posix)),
+        ObjectState::Symlink(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
+        ObjectState::Special(data) => data.core_meta_data.posix = Some(Box::new(new_posix)),
+        ObjectState::Directory(data) => data.posix = new_posix,
+        _ => {}
+    }
+    layout
+}
+
 pub struct InodeEntry {
     pub s3_key: String,
     pub entry_type: EntryType,
     pub layout: Option<ObjectLayout>,
     pub cache_expiry: Instant,
+    /// In-memory POSIX attrs. On lookup we seed it from the layout's
+    /// embedded `PosixAttrs`; setattr mutates this directly. The next
+    /// flush reads it back and folds it into the layout it serialises
+    /// so the changes survive the close-time round-trip.
+    pub posix: PosixAttrs,
+    /// `true` once unlink/rmdir has removed the name mapping for this
+    /// inode and issued the NSS delete. The kernel's dcache may still
+    /// hold a stale dentry pointing at this inode; subsequent FUSE
+    /// SETATTR / WRITE / RELEASE ops via that dentry must NOT write
+    /// the inode's bytes back to NSS, otherwise the unlinked file
+    /// resurrects (deterministic EEXIST on the next create at the same
+    /// name). Cleared on lookup_or_insert when a new inode is
+    /// allocated for the same key.
+    pub name_removed: bool,
+    /// In-memory atime override in nanoseconds since the Unix epoch.
+    /// `0` means "no explicit atime set; mirror mtime in stat replies".
+    /// Persisted `PosixAttrs` deliberately omits atime (we never bump
+    /// it on `read(2)`), so this field carries the explicit value an
+    /// `utimensat(2)` user supplied. Volatile across forget+relookup,
+    /// which matches POSIX's latitude and is enough for the
+    /// stat-immediately-after contract.
+    pub atime_ns: u64,
+    /// `Some(uuid)` once this inode has been promoted to a hardlink:
+    /// its real layout lives in the `#hardlink/<uuid>` `InodeRecord`,
+    /// and `layout` caches the resolved real layout (never an
+    /// `Indirect` redirect). `None` for an ordinary single-named file.
+    pub inode_id: Option<Uuid>,
     refcount: AtomicU64,
 }
 
 impl InodeEntry {
     fn new(s3_key: String, entry_type: EntryType, layout: Option<ObjectLayout>) -> Self {
+        let posix = layout.as_ref().map(layout_posix).unwrap_or_default();
         Self {
             s3_key,
             entry_type,
             layout,
             cache_expiry: Instant::now(),
+            posix,
+            name_removed: false,
+            atime_ns: 0,
+            inode_id: None,
             refcount: AtomicU64::new(1),
         }
     }
@@ -72,6 +156,10 @@ impl InodeTable {
                 entry_type: EntryType::Directory,
                 layout: None,
                 cache_expiry: Instant::now(),
+                posix: PosixAttrs::default(),
+                name_removed: false,
+                atime_ns: 0,
+                inode_id: None,
                 refcount: AtomicU64::new(u64::MAX), // root never gets forgotten
             },
         );
@@ -139,10 +227,31 @@ impl InodeTable {
         if ino == ROOT_INODE {
             return;
         }
-        if let Some(entry) = self.map.get(&ino) {
+        if let Some(mut entry) = self.map.get_mut(&ino) {
             self.key_to_ino
                 .remove(&(entry.s3_key.clone(), entry.entry_type));
+            // Mark the inode so any in-flight FUSE op via a now-stale
+            // dentry stops re-publishing to NSS and resurrecting the
+            // deleted name.
+            entry.name_removed = true;
         }
+    }
+
+    /// Register an additional name -> inode mapping without disturbing
+    /// the inode's primary `s3_key`. Used by `vfs_link` so a hardlink's
+    /// new name resolves to the same inode (and the same `inode_id`
+    /// resolution cache) as the original.
+    pub fn add_alias(&self, s3_key: &str, entry_type: EntryType, ino: u64) {
+        self.key_to_ino
+            .insert((s3_key.to_string(), entry_type), ino);
+    }
+
+    /// Drop a single name -> inode mapping without touching the
+    /// `InodeEntry` (so the inode and its other hardlink aliases stay
+    /// live). Used by `vfs_unlink` when one of several hardlink names
+    /// goes away but the inode still has links.
+    pub fn remove_alias(&self, s3_key: &str, entry_type: EntryType) {
+        self.key_to_ino.remove(&(s3_key.to_string(), entry_type));
     }
 
     /// Update the s3_key for an inode (used during rename).

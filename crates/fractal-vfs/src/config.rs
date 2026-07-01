@@ -1,6 +1,18 @@
 use serde::Deserialize;
 use std::time::Duration;
 
+fn default_prefetch_full_threshold_mb() -> u64 {
+    256
+}
+
+fn default_prefetch_partial_threshold_mb() -> u64 {
+    4096
+}
+
+fn default_prefetch_pressure_decline() -> f64 {
+    0.90
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub rss_addrs: Vec<String>,
@@ -29,6 +41,24 @@ pub struct Config {
     pub disk_cache_size_gb: u64,
     pub passthrough_enabled: bool,
     pub passthrough_max_object_size_gb: u64,
+
+    /// Open-time whole-blob prefetch threshold. Files at or below this
+    /// size always prefetch on open. Default 256 MiB.
+    #[serde(default = "default_prefetch_full_threshold_mb")]
+    pub prefetch_full_threshold_mb: u64,
+    /// Larger files prefetch only when the kernel sets `FOPEN_KEEP_CACHE`
+    /// (a sequential / bulk-read hint) and the file is at or below this
+    /// size. Default 4096 MiB.
+    #[serde(default = "default_prefetch_partial_threshold_mb")]
+    pub prefetch_partial_threshold_mb: u64,
+    /// Per-volume opt-in: always prefetch regardless of size hints.
+    /// Suitable for log / training / backup workloads.
+    #[serde(default)]
+    pub workload_bulk_read: bool,
+    /// Decline prefetch when current disk-cache usage is at or above
+    /// this fraction of capacity (0.0-1.0). Default 0.90.
+    #[serde(default = "default_prefetch_pressure_decline")]
+    pub prefetch_pressure_decline: f64,
 }
 
 impl Config {
@@ -79,6 +109,9 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
+        if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
+            self.allow_other = v.parse().unwrap_or(self.allow_other);
+        }
     }
 }
 
@@ -104,6 +137,10 @@ impl Default for Config {
             disk_cache_size_gb: 50,
             passthrough_enabled: false,
             passthrough_max_object_size_gb: 10,
+            prefetch_full_threshold_mb: default_prefetch_full_threshold_mb(),
+            prefetch_partial_threshold_mb: default_prefetch_partial_threshold_mb(),
+            workload_bulk_read: false,
+            prefetch_pressure_decline: default_prefetch_pressure_decline(),
         }
     }
 }
