@@ -853,7 +853,7 @@ impl DiskCache {
 
         // No per-file fdatasync here. The disk cache is a non-
         // authoritative read cache: durability is owned by BSS+NSS,
-        // which the synchronous flush has already published before this
+        // which the writeback flush has already published before this
         // mirror runs. A per-file fdatasync on a create-heavy workload
         // (one device barrier per file, 83k files on a linux untar)
         // dominates wall time (~51s) for zero correctness value.

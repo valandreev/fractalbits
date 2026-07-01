@@ -139,6 +139,17 @@ impl InodeEntry {
     }
 }
 
+/// Outcome of an `InodeTable::forget` refcount decrement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetOutcome {
+    /// Refcount still positive; entry stays.
+    Live,
+    /// Refcount hit zero and the entry was removed.
+    Removed,
+    /// Refcount hit zero but a pin kept the entry (`keep_if_zero`).
+    KeptZeroed,
+}
+
 pub struct InodeTable {
     map: DashMap<InodeId, InodeEntry>,
     next_ino: AtomicU64,
@@ -321,23 +332,76 @@ impl InodeTable {
         }
     }
 
-    /// Forget an inode (decrement refcount). Removes entry when refcount reaches 0.
-    /// Root inode is never removed.
-    pub fn forget(&self, ino: InodeId, nlookup: u64) {
+    /// Forget an inode (decrement refcount). Removes the entry when the
+    /// refcount reaches 0, unless `keep_if_zero` pins it (an async
+    /// release flush or a queued writeback intent still needs the entry;
+    /// the caller reaps it later via `remove_if_unreferenced`). Root is
+    /// never removed.
+    pub fn forget(&self, ino: InodeId, nlookup: u64, keep_if_zero: bool) -> ForgetOutcome {
         if ino == ROOT_INODE {
-            return;
+            return ForgetOutcome::Live;
         }
 
-        let should_remove = self
+        let zeroed = self
             .map
             .get(&ino)
             .map(|entry| entry.forget(nlookup))
             .unwrap_or(false);
-
-        if should_remove && let Some((_, entry)) = self.map.remove(&ino) {
-            self.key_to_ino
-                .remove(&(entry.s3_key.clone(), entry.entry_type));
+        if !zeroed {
+            return ForgetOutcome::Live;
         }
+        if keep_if_zero {
+            return ForgetOutcome::KeptZeroed;
+        }
+
+        if let Some((_, entry)) = self.map.remove(&ino) {
+            // Guard on the mapping still pointing here: after an unlink +
+            // recreate the key maps to a NEWER inode, and a blind remove
+            // would orphan the live entry.
+            self.key_to_ino
+                .remove_if(&(entry.s3_key.clone(), entry.entry_type), |_, mapped| {
+                    *mapped == ino
+                });
+            return ForgetOutcome::Removed;
+        }
+        ForgetOutcome::Live
+    }
+
+    /// `true` iff the entry exists with a zero refcount, i.e. a FORGET
+    /// zeroed it but a pin kept it alive.
+    pub fn is_unreferenced(&self, ino: InodeId) -> bool {
+        self.map
+            .get(&ino)
+            .map(|e| e.refcount.load(Ordering::Relaxed) == 0)
+            .unwrap_or(false)
+    }
+
+    /// Finish a deferred FORGET: remove the entry iff its refcount is
+    /// still 0 (a lookup that revived it in the meantime keeps it).
+    /// Returns `true` when the entry was removed.
+    pub fn remove_if_unreferenced(&self, ino: InodeId) -> bool {
+        if ino == ROOT_INODE {
+            return false;
+        }
+        let mut removed_key = None;
+        let removed = self
+            .map
+            .remove_if(&ino, |_, e| {
+                if e.refcount.load(Ordering::Relaxed) == 0 {
+                    removed_key = Some((e.s3_key.clone(), e.entry_type));
+                    true
+                } else {
+                    false
+                }
+            })
+            .is_some();
+        if let Some(key) = removed_key {
+            // The reaped entry's key can be stale (unlink + recreate while
+            // the deferred FORGET was pinned): only drop the mapping if it
+            // still points at this inode, not at a newer one.
+            self.key_to_ino.remove_if(&key, |_, mapped| *mapped == ino);
+        }
+        removed
     }
 }
 
