@@ -2,6 +2,7 @@ use fractal_fuse::*;
 use std::ffi::OsStr;
 use std::sync::Arc;
 
+use fractal_vfs::cache::DirEntryKind;
 use fractal_vfs::error::FsError;
 use fractal_vfs::vfs::{TTL, VfsAttr, VfsCore};
 
@@ -34,6 +35,30 @@ fn to_file_attr(va: &VfsAttr) -> FileAttr {
 
 fn fs_err(e: FsError) -> Errno {
     e.into()
+}
+
+fn file_type_from_dir_entry_kind(kind: DirEntryKind) -> FileType {
+    match kind {
+        DirEntryKind::RegularFile => FileType::RegularFile,
+        DirEntryKind::Directory => FileType::Directory,
+        DirEntryKind::Symlink => FileType::Symlink,
+        DirEntryKind::BlockDevice => FileType::BlockDevice,
+        DirEntryKind::CharDevice => FileType::CharDevice,
+        DirEntryKind::NamedPipe => FileType::NamedPipe,
+        DirEntryKind::Socket => FileType::Socket,
+    }
+}
+
+fn file_type_from_mode(mode: u32) -> FileType {
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => FileType::Directory,
+        libc::S_IFLNK => FileType::Symlink,
+        libc::S_IFBLK => FileType::BlockDevice,
+        libc::S_IFCHR => FileType::CharDevice,
+        libc::S_IFIFO => FileType::NamedPipe,
+        libc::S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    }
 }
 
 impl Filesystem for FuseServer {
@@ -590,11 +615,7 @@ impl Filesystem for FuseServer {
             .into_iter()
             .map(|e| DirectoryEntry {
                 ino: e.ino,
-                kind: if e.is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
+                kind: file_type_from_dir_entry_kind(e.kind),
                 name: e.name.into_bytes(),
                 offset: e.offset,
             })
@@ -619,11 +640,7 @@ impl Filesystem for FuseServer {
             .map(|e| DirectoryEntryPlus {
                 ino: e.ino,
                 generation: 0,
-                kind: if e.is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
+                kind: file_type_from_mode(e.attr.mode),
                 name: e.name.into_bytes(),
                 offset: e.offset,
                 attr: to_file_attr(&e.attr),

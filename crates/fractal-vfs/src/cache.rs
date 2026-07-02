@@ -7,7 +7,24 @@ use std::time::Duration;
 pub struct DirEntry {
     pub name: String,
     pub ino: u64,
-    pub is_dir: bool,
+    pub kind: DirEntryKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryKind {
+    RegularFile,
+    Directory,
+    Symlink,
+    BlockDevice,
+    CharDevice,
+    NamedPipe,
+    Socket,
+}
+
+impl DirEntryKind {
+    pub fn is_dir(self) -> bool {
+        self == Self::Directory
+    }
 }
 
 pub struct DirCache {
@@ -45,21 +62,21 @@ impl DirCache {
         )
     }
 
-    /// Like `has_children`, but counts only non-directory (file) children.
+    /// Like `has_children`, but counts only non-directory children.
     /// A directory child can be a phantom: readdir lists with a "/"
     /// delimiter, and a fully-tombstoned subtree still emits a CommonPrefix
     /// entry that lands in this cache, so a dir child here is not proof of
     /// non-emptiness (rmdir's no-delimiter NSS list, which filters
-    /// tombstones, is authoritative for those). A file child, however, is
-    /// a real local create not yet in NSS and must keep rmdir from
-    /// winning the race.
+    /// tombstones, is authoritative for those). A non-directory child,
+    /// however, is a real local create not yet in NSS and must keep rmdir
+    /// from winning the race.
     pub fn has_file_children(&self, prefix: &str) -> Option<bool> {
         let cached = self.inner.get(prefix)?;
         let entries = cached.read();
         Some(
             entries
                 .iter()
-                .any(|entry| !entry.is_dir && entry.name != "." && entry.name != ".."),
+                .any(|entry| !entry.kind.is_dir() && entry.name != "." && entry.name != ".."),
         )
     }
 
@@ -94,12 +111,12 @@ impl DirCache {
                 DirEntry {
                     name: ".".to_string(),
                     ino,
-                    is_dir: true,
+                    kind: DirEntryKind::Directory,
                 },
                 DirEntry {
                     name: "..".to_string(),
                     ino: parent,
-                    is_dir: true,
+                    kind: DirEntryKind::Directory,
                 },
             ])),
         );
@@ -123,7 +140,7 @@ mod tests {
             DirEntry {
                 name: "child".to_string(),
                 ino: 3,
-                is_dir: false,
+                kind: DirEntryKind::RegularFile,
             },
         );
         cache.upsert(
@@ -131,7 +148,7 @@ mod tests {
             DirEntry {
                 name: "child".to_string(),
                 ino: 4,
-                is_dir: true,
+                kind: DirEntryKind::Directory,
             },
         );
 
@@ -142,9 +159,36 @@ mod tests {
             .find(|entry| entry.name == "child")
             .expect("cached child missing");
         assert_eq!(child.ino, 4);
-        assert!(child.is_dir);
+        assert_eq!(child.kind, DirEntryKind::Directory);
         assert_eq!(cache.contains_name("dir/", "child"), Some(true));
         assert_eq!(cache.contains_name("dir/", "missing"), Some(false));
         assert_eq!(cache.has_children("dir/"), Some(true));
+    }
+
+    #[test]
+    fn non_directory_kinds_count_as_file_children() {
+        let cache = DirCache::new(Duration::from_secs(1));
+        cache.insert(
+            "dir/".to_string(),
+            vec![
+                DirEntry {
+                    name: ".".to_string(),
+                    ino: 2,
+                    kind: DirEntryKind::Directory,
+                },
+                DirEntry {
+                    name: "..".to_string(),
+                    ino: 1,
+                    kind: DirEntryKind::Directory,
+                },
+                DirEntry {
+                    name: "link".to_string(),
+                    ino: 3,
+                    kind: DirEntryKind::Symlink,
+                },
+            ],
+        );
+
+        assert_eq!(cache.has_file_children("dir/"), Some(true));
     }
 }

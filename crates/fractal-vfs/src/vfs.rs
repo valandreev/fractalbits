@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendConfig, BlobInfo, StorageBackend};
-use crate::cache::{DirCache, DirEntry};
+use crate::cache::{DirCache, DirEntry, DirEntryKind};
 use crate::disk_cache::DiskCache;
 use crate::error::FsError;
 use crate::inode::{EntryType, InodeTable, ROOT_INODE};
@@ -80,7 +80,7 @@ impl VfsAttr {
 pub struct VfsDirEntry {
     pub ino: u64,
     pub offset: u64,
-    pub is_dir: bool,
+    pub kind: DirEntryKind,
     pub name: String,
 }
 
@@ -88,7 +88,7 @@ pub struct VfsDirEntry {
 pub struct VfsDirEntryPlus {
     pub ino: u64,
     pub offset: u64,
-    pub is_dir: bool,
+    pub kind: DirEntryKind,
     pub name: String,
     pub attr: VfsAttr,
 }
@@ -431,15 +431,29 @@ impl VfsCore {
         self.inodes.get_s3_key(ino)
     }
 
-    fn cache_dir_entry(&self, prefix: &str, name: &str, ino: u64, is_dir: bool) {
+    fn cache_dir_entry(&self, prefix: &str, name: &str, ino: u64, kind: DirEntryKind) {
         self.dir_cache.upsert(
             prefix,
             DirEntry {
                 name: name.to_string(),
                 ino,
-                is_dir,
+                kind,
             },
         );
+    }
+
+    fn dir_entry_kind_from_layout(layout: &ObjectLayout) -> DirEntryKind {
+        match &layout.state {
+            ObjectState::Symlink(_) => DirEntryKind::Symlink,
+            ObjectState::Special(data) => match data.kind {
+                SpecialKind::Fifo => DirEntryKind::NamedPipe,
+                SpecialKind::BlockDevice => DirEntryKind::BlockDevice,
+                SpecialKind::CharDevice => DirEntryKind::CharDevice,
+                SpecialKind::Socket => DirEntryKind::Socket,
+            },
+            ObjectState::Directory(_) => DirEntryKind::Directory,
+            _ => DirEntryKind::RegularFile,
+        }
     }
 
     fn check_write_enabled(&self) -> Result<(), FsError> {
@@ -1876,7 +1890,7 @@ impl VfsCore {
             .rsplit_once('/')
             .map(|(_, n)| n.to_string())
             .unwrap_or_else(|| s3_key.clone());
-        self.cache_dir_entry(&parent_prefix, &name, ino, false);
+        self.cache_dir_entry(&parent_prefix, &name, ino, DirEntryKind::RegularFile);
 
         // Sync the local disk cache to the writer's just-published
         // state: rewrites land at their natural offsets, deletes
@@ -2076,12 +2090,12 @@ impl VfsCore {
         all_entries.push(DirEntry {
             name: ".".to_string(),
             ino: parent,
-            is_dir: true,
+            kind: DirEntryKind::Directory,
         });
         all_entries.push(DirEntry {
             name: "..".to_string(),
             ino: dotdot_ino,
-            is_dir: true,
+            kind: DirEntryKind::Directory,
         });
 
         let mut start_after = String::new();
@@ -2114,13 +2128,14 @@ impl VfsCore {
                     if name.is_empty() {
                         continue;
                     }
+                    let kind = Self::dir_entry_kind_from_layout(layout);
                     let (ino, _) =
                         self.inodes
                             .lookup_or_insert(raw_key, EntryType::File, entry.layout);
                     all_entries.push(DirEntry {
                         name: name.to_string(),
                         ino,
-                        is_dir: false,
+                        kind,
                     });
                 } else {
                     // Directory (common prefix)
@@ -2135,7 +2150,7 @@ impl VfsCore {
                     all_entries.push(DirEntry {
                         name: dir_name.to_string(),
                         ino,
-                        is_dir: true,
+                        kind: DirEntryKind::Directory,
                     });
                 }
             }
@@ -2568,7 +2583,7 @@ impl VfsCore {
         // Map the new name to the inode and refresh dir caches/times.
         self.inodes.add_alias(&new_key, EntryType::File, inode);
 
-        self.cache_dir_entry(&new_prefix, new_name, inode, false);
+        self.cache_dir_entry(&new_prefix, new_name, inode, DirEntryKind::RegularFile);
         self.touch_parent_times(new_parent);
 
         let mut attr = self.make_file_attr(inode, &record.layout)?;
@@ -3303,7 +3318,12 @@ impl VfsCore {
         self.publish_inode_layout(&key, layout_bytes, &trace_id)
             .await?;
 
-        self.cache_dir_entry(&prefix, name, ino, false);
+        self.cache_dir_entry(
+            &prefix,
+            name,
+            ino,
+            Self::dir_entry_kind_from_layout(&layout),
+        );
         self.touch_parent_times(parent);
 
         self.make_file_attr(ino, &layout)
@@ -4205,7 +4225,7 @@ impl VfsCore {
 
         let attr = self.make_new_file_attr(ino, 0);
 
-        self.cache_dir_entry(&prefix, name, ino, false);
+        self.cache_dir_entry(&prefix, name, ino, DirEntryKind::RegularFile);
         self.touch_parent_times(parent);
 
         Ok((attr, fh))
@@ -4289,7 +4309,7 @@ impl VfsCore {
         self.publish_inode_layout(&key, layout_bytes, &trace_id)
             .await?;
 
-        self.cache_dir_entry(&prefix, name, ino, false);
+        self.cache_dir_entry(&prefix, name, ino, DirEntryKind::Symlink);
         self.touch_parent_times(parent);
 
         self.make_file_attr(ino, &layout)
@@ -4535,7 +4555,7 @@ impl VfsCore {
         self.publish_inode_layout(&key, layout_bytes, &trace_id)
             .await?;
 
-        self.cache_dir_entry(&prefix, name, ino, true);
+        self.cache_dir_entry(&prefix, name, ino, DirEntryKind::Directory);
         self.dir_cache.insert_empty_dir(key.clone(), ino, parent);
         self.touch_parent_times(parent);
 
@@ -4742,7 +4762,7 @@ impl VfsCore {
             .enumerate()
             .map(|(idx, entry)| VfsDirEntry {
                 ino: entry.ino,
-                is_dir: entry.is_dir,
+                kind: entry.kind,
                 name: entry.name.clone(),
                 offset: (offset + idx + 1) as u64,
             })
@@ -4769,7 +4789,7 @@ impl VfsCore {
         let mut record_cache: std::collections::HashMap<uuid::Uuid, InodeRecord> =
             std::collections::HashMap::new();
         for (idx, entry) in dir_entries.iter().skip(offset).enumerate() {
-            let attr = if entry.is_dir {
+            let attr = if entry.kind.is_dir() {
                 self.make_dir_attr(entry.ino)
             } else {
                 // Clone the cached layout out (dropping the map guard before
@@ -4830,7 +4850,7 @@ impl VfsCore {
             };
             entries.push(VfsDirEntryPlus {
                 ino: entry.ino,
-                is_dir: entry.is_dir,
+                kind: entry.kind,
                 name: entry.name.clone(),
                 offset: (offset + idx + 1) as u64,
                 attr,
