@@ -73,6 +73,15 @@ pub struct InodeEntry {
     /// flush reads it back and folds it into the layout it serialises
     /// so the changes survive the close-time round-trip.
     pub posix: PosixAttrs,
+    /// `false` when `posix` is a placeholder default, not the inode's
+    /// authoritative owner/mode. A directory materialised from a
+    /// delimiter listing (readdir common-prefix, lookup prefix-listing
+    /// fallback) has no layout to seed from, so its `posix` defaults to
+    /// uid 0 / mode 0; trusting that default makes the setattr owner
+    /// check reject the real owner with EPERM. The async attr paths
+    /// (`vfs_getattr`, `lookup_or_insert` when a marker arrives) refresh
+    /// `posix` from the NSS marker and flip this true.
+    pub posix_known: bool,
     /// `true` once unlink/rmdir has removed the name mapping for this
     /// inode and issued the NSS delete. The kernel's dcache may still
     /// hold a stale dentry pointing at this inode; subsequent FUSE
@@ -101,12 +110,16 @@ pub struct InodeEntry {
 impl InodeEntry {
     fn new(s3_key: String, entry_type: EntryType, layout: Option<ObjectLayout>) -> Self {
         let posix = layout.as_ref().map(layout_posix).unwrap_or_default();
+        // Authoritative only when seeded from a layout; a `None` seed
+        // leaves `posix` at its default placeholder.
+        let posix_known = layout.is_some();
         Self {
             s3_key,
             entry_type,
             layout,
             cache_expiry: Instant::now(),
             posix,
+            posix_known,
             name_removed: false,
             atime_ns: 0,
             inode_id: None,
@@ -157,6 +170,10 @@ impl InodeTable {
                 layout: None,
                 cache_expiry: Instant::now(),
                 posix: PosixAttrs::default(),
+                // Root has no NSS marker; make_dir_attr special-cases it
+                // (mode 0o777) and it is never owner-checked, so treat its
+                // placeholder posix as authoritative to skip marker fetches.
+                posix_known: true,
                 name_removed: false,
                 atime_ns: 0,
                 inode_id: None,
@@ -187,6 +204,15 @@ impl InodeTable {
                 if let Some(new_layout) = layout
                     && let Some(mut entry) = self.map.get_mut(&ino)
                 {
+                    // Seed authoritative posix into an entry whose owner/mode
+                    // is still a listing-materialised placeholder. Guarded on
+                    // `!posix_known` so a real (possibly locally-mutated,
+                    // not-yet-flushed) posix is never clobbered by a stale
+                    // marker.
+                    if !entry.posix_known {
+                        entry.posix = layout_posix(&new_layout);
+                        entry.posix_known = true;
+                    }
                     entry.layout = Some(new_layout);
                     entry.cache_expiry = Instant::now();
                 }
@@ -331,5 +357,87 @@ impl InodeTable {
             }
         }
         evicted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data_types::object_layout::DirectoryData;
+
+    fn dir_layout(uid: u32, gid: u32, mode: u32) -> ObjectLayout {
+        ObjectLayout {
+            timestamp: 0,
+            version_id: ObjectLayout::gen_version_id(),
+            block_size: 4096,
+            blob_version: 1,
+            state: ObjectState::Directory(DirectoryData {
+                posix: PosixAttrs {
+                    mode,
+                    uid,
+                    gid,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn none_seed_dir_is_posix_unknown_then_refreshes_from_marker() {
+        let table = InodeTable::new();
+        let key = "d/";
+
+        // readdir common-prefix / lookup prefix-fallback: no layout, so the
+        // owner is a placeholder and must be flagged not-authoritative.
+        let (ino, is_new) = table.lookup_or_insert(key, EntryType::Directory, None);
+        assert!(is_new, "first insert allocates a new inode");
+        {
+            let e = table.get(ino).expect("entry present");
+            assert!(!e.posix_known, "None-seed dir must be posix-unknown");
+            assert_eq!(e.posix.uid, 0, "placeholder owner is uid 0");
+        }
+
+        // A later lookup that reads the authoritative marker seeds the real
+        // owner into the existing (poisoned) entry and marks it known.
+        let (ino2, is_new2) = table.lookup_or_insert(
+            key,
+            EntryType::Directory,
+            Some(dir_layout(1000, 1001, 0o755)),
+        );
+        assert_eq!(ino2, ino, "same key resolves to the same inode");
+        assert!(!is_new2, "second lookup reuses the entry");
+        let e = table.get(ino).expect("entry present");
+        assert!(e.posix_known, "marker lookup marks posix authoritative");
+        assert_eq!(e.posix.uid, 1000, "owner refreshed from the marker");
+        assert_eq!(e.posix.gid, 1001, "group refreshed from the marker");
+    }
+
+    #[test]
+    fn known_posix_is_not_clobbered_by_a_later_marker() {
+        // A dir seeded from its marker (known), then locally chmod'd but not
+        // yet flushed, must not be reverted by a subsequent marker-bearing
+        // lookup carrying the stale mode.
+        let table = InodeTable::new();
+        let key = "d/";
+        let (ino, _) = table.lookup_or_insert(
+            key,
+            EntryType::Directory,
+            Some(dir_layout(1000, 1000, 0o755)),
+        );
+        {
+            let mut e = table.get_mut(ino).expect("entry present");
+            e.posix.mode = 0o700; // unflushed local chmod
+        }
+        table.lookup_or_insert(
+            key,
+            EntryType::Directory,
+            Some(dir_layout(1000, 1000, 0o755)),
+        );
+        let e = table.get(ino).expect("entry present");
+        assert_eq!(
+            e.posix.mode, 0o700,
+            "known (locally mutated) posix must survive a stale marker lookup"
+        );
     }
 }

@@ -131,9 +131,13 @@ impl Filesystem for FuseServer {
         // block.
         if req.uid != 0 {
             // In-memory attrs are sufficient for ordinary inodes. Hardlinks
-            // store owner/mode in the shared NSS record, so permission checks
-            // must read the authoritative record instead of a stale alias cache.
-            let cur = if self.vfs.is_hardlink(inode) {
+            // store owner/mode in the shared NSS record, and a directory
+            // materialised from a delimiter listing carries only placeholder
+            // posix (uid 0); both must read the authoritative owner via the
+            // async path (which refreshes from the NSS marker) instead of a
+            // stale/placeholder in-memory value, or the owner check rejects
+            // the real owner with EPERM.
+            let cur = if self.vfs.is_hardlink(inode) || self.vfs.is_dir(inode) {
                 self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?
             } else {
                 self.vfs.vfs_getattr_inmem(inode, fh).map_err(fs_err)?
