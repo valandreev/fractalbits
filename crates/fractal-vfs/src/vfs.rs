@@ -2746,6 +2746,12 @@ impl VfsCore {
             return Ok(self.make_new_file_attr(inode, wb.file_size));
         }
 
+        // A directory materialised from a delimiter listing carries only
+        // placeholder posix (uid 0 / mode 0); fetch its marker so stat and
+        // the setattr owner check see the real owner. No-op for files or an
+        // already-authoritative entry.
+        self.refresh_dir_posix_if_unknown(inode).await;
+
         let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
 
         match entry.entry_type {
@@ -2893,6 +2899,36 @@ impl VfsCore {
             .get(inode)
             .map(|e| e.inode_id.is_some())
             .unwrap_or(false)
+    }
+
+    pub fn is_dir(&self, inode: u64) -> bool {
+        self.inodes
+            .get(inode)
+            .map(|e| e.entry_type == EntryType::Directory)
+            .unwrap_or(false)
+    }
+
+    /// Seed authoritative posix into a directory entry whose owner/mode is
+    /// still a listing-materialised placeholder (`posix_known == false`),
+    /// by reading its NSS marker. No-op for files, the root, an entry with
+    /// known posix, or a marker that has no directory layout (a legacy
+    /// Normal marker / implicit directory keeps its default). Guarded on
+    /// `!posix_known` again after the fetch so a concurrent local posix
+    /// mutation is never clobbered.
+    async fn refresh_dir_posix_if_unknown(&self, inode: u64) {
+        let dir_key = match self.inodes.get(inode) {
+            Some(e) if e.entry_type == EntryType::Directory && !e.posix_known => e.s3_key.clone(),
+            _ => return,
+        };
+        let trace_id = TraceId::new();
+        if let Ok(layout) = self.backend().get_inode(&dir_key, &trace_id).await
+            && layout.is_directory()
+            && let Some(mut e) = self.inodes.get_mut(inode)
+            && !e.posix_known
+        {
+            e.posix = crate::inode::layout_posix(&layout);
+            e.posix_known = true;
+        }
     }
 
     pub fn vfs_getattr_inmem(&self, inode: u64, fh: Option<u64>) -> Result<VfsAttr, FsError> {
@@ -4780,6 +4816,35 @@ impl VfsCore {
         let dir_entries = self.fetch_dir_entries(parent, &prefix).await?;
 
         let offset = offset as usize;
+
+        // A subdirectory row comes from the delimiter listing as a
+        // common-prefix with no posix, so its entry carries the uid-0
+        // placeholder. Seed the real owner from each marker before building
+        // attrs, or readdirplus emits uid 0 and the kernel caches it (a
+        // later stat/chmod then sees the placeholder owner). Concurrent to
+        // bound the cost on a cold `ls` of a many-subdir directory; a
+        // posix-known entry is skipped, so repeat listings pay nothing.
+        let unknown_dirs: Vec<u64> = dir_entries
+            .iter()
+            .skip(offset)
+            .filter(|e| e.kind.is_dir())
+            .map(|e| e.ino)
+            .filter(|&ino| {
+                self.inodes
+                    .get(ino)
+                    .map(|e| !e.posix_known)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !unknown_dirs.is_empty() {
+            futures::future::join_all(
+                unknown_dirs
+                    .into_iter()
+                    .map(|ino| self.refresh_dir_posix_if_unknown(ino)),
+            )
+            .await;
+        }
+
         let trace_id = TraceId::new();
         let mut entries: Vec<VfsDirEntryPlus> =
             Vec::with_capacity(dir_entries.len().saturating_sub(offset));
