@@ -119,13 +119,6 @@ thread_local! {
 /// open, and serves dirty-handle reads per block.
 #[derive(Debug, Clone)]
 enum BlockState {
-    /// Bytes lazily loaded from BSS for a read or partial-block edit.
-    /// Flush does NOT upload these; they let reads / RMW avoid re-fetching
-    /// from BSS within the same handle session. Currently only produced
-    /// transiently during RMW (writes promote the merged block to
-    /// `Rewrite`); reserved for a future read-side cache.
-    #[allow(dead_code)]
-    Cached(Bytes),
     /// Definitive new bytes for this block. Origin: `vfs_write`, a shrink
     /// tail-zero, or a punch-hole partial edge. The override flush uploads
     /// these (zero-padded to block_size) at the new blob_version.
@@ -394,9 +387,9 @@ impl VfsCore {
     }
 
     /// Install the shared `/dev/fuse` fd, obtained from
-    /// `Session::fuse_fd()`, before the session is run. FUSE-mode only;
-    /// NFS mode never calls this. The fd is needed by passthrough open /
-    /// close paths that may fire on the very first FUSE request.
+    /// `Session::fuse_fd()`, before the session is run. The fd is needed
+    /// by passthrough open / close paths that may fire on the very first
+    /// FUSE request.
     pub fn with_fuse_fd(mut self, fuse_dev_fd: Arc<OwnedFd>) -> Self {
         self.fuse_dev_fd = Some(fuse_dev_fd);
         self
@@ -950,87 +943,6 @@ impl VfsCore {
         Ok(cached)
     }
 
-    async fn read_normal(
-        &self,
-        layout: &ObjectLayout,
-        offset: u64,
-        size: u32,
-    ) -> Result<Bytes, FsError> {
-        let file_size = self.authoritative_file_size(layout).await?;
-        if size == 0 || offset >= file_size {
-            return Ok(Bytes::new());
-        }
-
-        let blob_guid = layout.blob_guid()?;
-        let block_size = layout.block_size as u64;
-        let read_end = std::cmp::min(offset.saturating_add(size as u64), file_size);
-        let actual_len = (read_end - offset) as usize;
-
-        let first_block = (offset / block_size) as u32;
-        let last_block = ((read_end - 1) / block_size) as u32;
-
-        let trace_id = TraceId::new();
-
-        // Fast path: single-block read can return a zero-copy Bytes slice
-        if first_block == last_block {
-            let block_num = first_block;
-            let block_start = block_num as u64 * block_size;
-            let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
-
-            let block_data = self
-                .read_block_cached(
-                    blob_guid,
-                    layout.blob_version,
-                    block_num,
-                    block_content_len,
-                    file_size,
-                    &trace_id,
-                )
-                .await?;
-
-            let slice_start = (offset - block_start) as usize;
-            let slice_end = std::cmp::min((read_end - block_start) as usize, block_data.len());
-            return Ok(block_data.slice(slice_start..slice_end));
-        }
-
-        // Multi-block read: assemble from multiple blocks
-        let mut result = BytesMut::with_capacity(actual_len);
-
-        for block_num in first_block..=last_block {
-            let block_start = block_num as u64 * block_size;
-            let block_content_len = std::cmp::min(block_size, file_size - block_start) as usize;
-
-            let block_data = self
-                .read_block_cached(
-                    blob_guid,
-                    layout.blob_version,
-                    block_num,
-                    block_content_len,
-                    file_size,
-                    &trace_id,
-                )
-                .await?;
-
-            let slice_start = if block_num == first_block {
-                (offset - block_start) as usize
-            } else {
-                0
-            };
-            let slice_end = if block_num == last_block {
-                (read_end - block_start) as usize
-            } else {
-                block_data.len()
-            };
-
-            if slice_start < block_data.len() {
-                let end = std::cmp::min(slice_end, block_data.len());
-                result.extend_from_slice(&block_data[slice_start..end]);
-            }
-        }
-
-        Ok(result.freeze())
-    }
-
     async fn read_mpu(
         &self,
         key: &str,
@@ -1363,7 +1275,7 @@ impl VfsCore {
     }
 
     /// Serve a read against a dirty write handle by merging per-block
-    /// intents (`Rewrite`/`Cached` bytes, `Delete`/shrunk-range zeros,
+    /// intents (`Rewrite` bytes, `Delete`/shrunk-range zeros,
     /// else lazy-loaded committed bytes) over the buffered `file_size`.
     #[allow(clippy::too_many_arguments)]
     async fn read_dirty_handle(
@@ -1404,7 +1316,7 @@ impl VfsCore {
             let chunk_len = slice_end.saturating_sub(slice_start);
 
             let block_bytes: Bytes = match blocks.get(&b) {
-                Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => b2.clone(),
+                Some(BlockState::Rewrite(b2)) => b2.clone(),
                 Some(BlockState::Delete) => Bytes::from(vec![0u8; block_content_len]),
                 None => {
                     if eof_low_watermark.is_some_and(|low| b >= low) {
@@ -3031,9 +2943,7 @@ impl VfsCore {
                     let kept = (new_size % bsz_u64) as usize;
                     let block_was_committed = (last as u64) * bsz_u64 < committed_size;
                     let buffered_prefix: Option<Bytes> = match wb.blocks.get(&last) {
-                        Some(BlockState::Rewrite(b)) | Some(BlockState::Cached(b)) => {
-                            Some(b.clone())
-                        }
+                        Some(BlockState::Rewrite(b)) => Some(b.clone()),
                         _ => None,
                     };
                     if block_was_committed || buffered_prefix.is_some() {
@@ -3405,7 +3315,7 @@ impl VfsCore {
         // otherwise the inode is left permanently EBUSY.
         //
         // Persisting the resolved `inode_id` is also what stops a cold-cache
-        // Indirect entry (e.g. populated by readdirplus/NFS without a prior
+        // Indirect entry (e.g. populated by readdirplus without a prior
         // vfs_lookup) from flushing a Normal layout over its redirect: the
         // flush keys its record-aware path on `entry.inode_id`. The redirect
         // itself has no blob_guid, so the resolved real layout is also what
@@ -3569,61 +3479,6 @@ impl VfsCore {
         Ok(fh)
     }
 
-    /// Read data from an open file handle, returning owned Bytes.
-    /// Used by NFS path (vfs_read_by_ino) which needs owned data.
-    async fn vfs_read_bytes(&self, fh: u64, offset: u64, size: u32) -> Result<Bytes, FsError> {
-        let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
-
-        // If there's a dirty write buffer, merge per-block intents over
-        // the committed bytes (sparse-aware), returning owned Bytes.
-        if let Some(ref wb) = handle.write_buf
-            && wb.dirty
-        {
-            let file_size = wb.file_size;
-            let block_size = wb.block_size;
-            let existing_blob_guid = wb.existing_blob_guid;
-            let eof_low_watermark = wb.eof_low_watermark;
-            let blocks = wb.blocks.clone();
-            let committed_blob_version =
-                handle.layout.as_ref().map(|l| l.blob_version).unwrap_or(0);
-            drop(handle);
-            if offset >= file_size {
-                return Ok(Bytes::new());
-            }
-            let want = std::cmp::min(size as u64, file_size - offset) as usize;
-            let mut buf = vec![0u8; want];
-            let n = self
-                .read_dirty_handle(
-                    file_size,
-                    block_size,
-                    existing_blob_guid,
-                    committed_blob_version,
-                    &blocks,
-                    eof_low_watermark,
-                    offset,
-                    &mut buf,
-                )
-                .await?;
-            buf.truncate(n);
-            return Ok(Bytes::from(buf));
-        }
-
-        let s3_key = handle.s3_key.clone();
-        let layout = match &handle.layout {
-            Some(l) => l.clone(),
-            None => return Ok(Bytes::new()),
-        };
-        drop(handle);
-
-        match &layout.state {
-            ObjectState::Normal(_) => self.read_normal(&layout, offset, size).await,
-            ObjectState::Mpu(MpuState::Completed(_)) => {
-                self.read_mpu(&s3_key, &layout, offset, size).await
-            }
-            _ => Err(FsError::InvalidState),
-        }
-    }
-
     pub async fn vfs_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
         // POSIX: zero-byte writes are a no-op and must NOT extend the
         // file. Early return also avoids the `end - 1` underflow below.
@@ -3731,7 +3586,7 @@ impl VfsCore {
             let copy_dst_start = offset.saturating_sub(block_start).min(bsz_u64) as usize;
             let copy_dst_end = (end.saturating_sub(block_start).min(bsz_u64)) as usize;
             let mut block_bytes: BytesMut = match wb.blocks.get(&b) {
-                Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
+                Some(BlockState::Rewrite(b2)) => {
                     let mut bm = BytesMut::with_capacity(wb.block_size as usize);
                     bm.extend_from_slice(b2);
                     if bm.len() < wb.block_size as usize {
@@ -3831,15 +3686,12 @@ impl VfsCore {
                 // Determine which edge blocks need a lazy load. We only
                 // load when:
                 //   - The block has committed bytes in BSS, AND
-                //   - There isn't already a buffered (Rewrite/Cached)
+                //   - There isn't already a buffered `Rewrite`
                 //     copy we can edit in place, AND
                 //   - The shrink-destroys watermark hasn't already
                 //     turned this block into zeros.
                 let mut consider_edge = |b: u32| {
-                    if matches!(
-                        wb.blocks.get(&b),
-                        Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
-                    ) {
+                    if matches!(wb.blocks.get(&b), Some(BlockState::Rewrite(_))) {
                         return;
                     }
                     if wb.block_destroyed_by_shrink(b) {
@@ -3923,9 +3775,7 @@ impl VfsCore {
                              hi: usize| {
                 let mut buf = BytesMut::with_capacity(bsz_usize);
                 let existing: Option<Bytes> = match wb.blocks.get(&b) {
-                    Some(BlockState::Rewrite(b2)) | Some(BlockState::Cached(b2)) => {
-                        Some(b2.clone())
-                    }
+                    Some(BlockState::Rewrite(b2)) => Some(b2.clone()),
                     _ => loaded.get(&b).cloned(),
                 };
                 if let Some(existing) = existing {
@@ -3984,10 +3834,7 @@ impl VfsCore {
             // Don't shadow buffered Rewrite or committed Data with a
             // reservation entry; the reservation is only for blocks
             // that don't already have content.
-            if matches!(
-                wb.blocks.get(&b),
-                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_))
-            ) {
+            if matches!(wb.blocks.get(&b), Some(BlockState::Rewrite(_))) {
                 continue;
             }
             wb.pending_reservations.insert(b);
@@ -4072,7 +3919,7 @@ impl VfsCore {
         // `None` -> not buffered, fall through to the BSS probe.
         let buffered_kind = |b: u32| -> Option<bool> {
             match blocks.get(&b) {
-                Some(BlockState::Rewrite(_)) | Some(BlockState::Cached(_)) => Some(true),
+                Some(BlockState::Rewrite(_)) => Some(true),
                 Some(BlockState::Delete) => Some(false),
                 None => {
                     if pending_reservations.contains(&b) {
@@ -4923,54 +4770,6 @@ impl VfsCore {
         }
 
         Ok(entries)
-    }
-
-    /// Stateless read by inode (for NFS). Opens, reads, and releases in one call.
-    pub async fn vfs_read_by_ino(
-        &self,
-        inode: u64,
-        offset: u64,
-        count: u32,
-    ) -> Result<Bytes, FsError> {
-        let fh = self.vfs_open(inode, libc::O_RDONLY as u32).await?;
-        let result = self.vfs_read_bytes(fh, offset, count).await;
-        let _ = self.vfs_release(fh).await;
-        result
-    }
-
-    /// Stateless write by inode (for NFS). Opens, writes, flushes, and releases.
-    pub async fn vfs_write_by_ino(
-        &self,
-        inode: u64,
-        offset: u64,
-        data: &[u8],
-    ) -> Result<u32, FsError> {
-        let fh = self.vfs_open(inode, libc::O_WRONLY as u32).await?;
-        let result = self.vfs_write(fh, offset, data).await;
-        if result.is_ok() {
-            let _ = self.vfs_flush(fh).await;
-        }
-        let _ = self.vfs_release(fh).await;
-        result
-    }
-
-    /// Evict stale inodes that have no open file handles. For NFS mode where
-    /// there is no FUSE FORGET mechanism.
-    pub fn vfs_evict_stale_inodes(&self, ttl: Duration) {
-        let evicted = self.inodes.evict_stale(ttl);
-        // Re-insert any inodes that still have open file handles
-        for ino in &evicted {
-            if self.has_open_handles_for_inode(*ino, None) {
-                // The inode was evicted but still has open handles.
-                // The handle holds its own s3_key/layout, so NFS ops
-                // in flight will still work. New lookups will re-create
-                // the inode entry.
-                tracing::debug!(ino = ino, "skipped eviction: open handles");
-            }
-        }
-        if !evicted.is_empty() {
-            tracing::debug!(count = evicted.len(), "evicted stale inodes");
-        }
     }
 
     pub fn vfs_statfs(&self) -> VfsStatfs {

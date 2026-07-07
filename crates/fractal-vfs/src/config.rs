@@ -19,8 +19,6 @@ pub struct Config {
     pub bucket_name: String,
     pub mount_point: String,
 
-    pub nfs_port: u16,
-
     pub rpc_request_timeout_seconds: u64,
     pub rpc_connection_timeout_seconds: u64,
     pub rss_rpc_timeout_seconds: u64,
@@ -103,9 +101,6 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_DISK_CACHE_SIZE_GB") {
             self.disk_cache_size_gb = v.parse().unwrap_or(self.disk_cache_size_gb);
         }
-        if let Ok(v) = std::env::var("FS_SERVER_NFS_PORT") {
-            self.nfs_port = v.parse().unwrap_or(self.nfs_port);
-        }
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
@@ -130,7 +125,6 @@ impl Default for Config {
             dir_cache_ttl_seconds: 5,
             attr_cache_ttl_seconds: 5,
             block_cache_size_mb: 256,
-            nfs_port: 2049,
             read_write: false,
             disk_cache_enabled: false,
             disk_cache_path: "/var/cache/fractalbits/".to_string(),
