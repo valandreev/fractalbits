@@ -1,8 +1,9 @@
+use parking_lot::Mutex;
 use std::io;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -188,13 +189,13 @@ impl CacheTracker {
 
     /// Record an access to a cache file (promotes to MRU).
     fn touch(&self, blob_id: Uuid, vol: u16) {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self.inner.lock();
         let _ = inner.lru.get(&(blob_id, vol));
     }
 
     /// Record a new block insertion. Returns the new total_usage.
     fn record_insert(&self, blob_id: Uuid, vol: u16, added_bytes: u64) -> u64 {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self.inner.lock();
         if let Some(disk_bytes) = inner.lru.get_mut(&(blob_id, vol)) {
             *disk_bytes += added_bytes;
         } else {
@@ -205,15 +206,12 @@ impl CacheTracker {
     }
 
     fn current_usage(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("tracker lock poisoned")
-            .total_usage
+        self.inner.lock().total_usage
     }
 
     /// Remove a file from tracking. Subtracts tracked bytes from total_usage.
     fn remove(&self, blob_id: Uuid, vol: u16) {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self.inner.lock();
         if let Some(disk_bytes) = inner.lru.pop(&(blob_id, vol)) {
             inner.total_usage = inner.total_usage.saturating_sub(disk_bytes);
         }
@@ -221,7 +219,7 @@ impl CacheTracker {
 
     /// Pop the least-recently-used entry. Returns its key and tracked bytes.
     fn pop_lru(&self) -> Option<((Uuid, u16), u64)> {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self.inner.lock();
         let ((blob_id, vol), disk_bytes) = inner.lru.pop_lru()?;
         inner.total_usage = inner.total_usage.saturating_sub(disk_bytes);
         Some(((blob_id, vol), disk_bytes))
@@ -229,7 +227,7 @@ impl CacheTracker {
 
     /// Insert a cold-start entry (appended at LRU end, i.e. oldest).
     fn insert_cold(&self, blob_id: Uuid, vol: u16, disk_bytes: u64) {
-        let mut inner = self.inner.lock().expect("tracker lock poisoned");
+        let mut inner = self.inner.lock();
         inner.lru.push((blob_id, vol), disk_bytes);
         inner.lru.demote(&(blob_id, vol));
         inner.total_usage += disk_bytes;
@@ -238,14 +236,14 @@ impl CacheTracker {
     /// Number of tracked files.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.inner.lock().expect("tracker lock poisoned").lru.len()
+        self.inner.lock().lru.len()
     }
 
     /// Peek at the LRU ordering (oldest first) without modifying it.
     /// Used only in tests.
     #[cfg(test)]
     fn peek_lru_order(&self) -> Vec<(Uuid, u16)> {
-        let inner = self.inner.lock().expect("tracker lock poisoned");
+        let inner = self.inner.lock();
         inner.lru.iter().rev().map(|(&k, _)| k).collect()
     }
 }
@@ -364,7 +362,6 @@ impl DiskCache {
     fn memory_floor(&self, blob_id: Uuid, vol: u16) -> u64 {
         self.version_floors
             .lock()
-            .expect("version floor lock poisoned")
             .get(&(blob_id, vol))
             .copied()
             .unwrap_or(0)
@@ -374,10 +371,7 @@ impl DiskCache {
         if version <= 1 {
             return;
         }
-        let mut floors = self
-            .version_floors
-            .lock()
-            .expect("version floor lock poisoned");
+        let mut floors = self.version_floors.lock();
         if let Some(entry) = floors.get_mut(&(blob_id, vol)) {
             if version > *entry {
                 *entry = version;
