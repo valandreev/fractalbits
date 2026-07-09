@@ -4,12 +4,20 @@ use crate::abi;
 
 pub type Errno = i32;
 
-/// A FUSE inode number (`nodeid` on the wire).
+/// A FUSE node id (`nodeid` on the wire).
 ///
-/// Identifies a filesystem object (file, directory, symlink, device node).
-/// Stable across opens and shared by every handle onto the same object; this
-/// is what `lookup` resolves a name to. A distinct newtype from
-/// [`FileHandleId`] so the two can never be swapped by accident.
+/// The kernel's handle for a filesystem object (file, directory, symlink,
+/// device node): what `lookup` resolves a name to, and how later requests
+/// name the object. Not the same as the object's `st_ino` (that is the
+/// separate `ino` field in [`FileAttr`]), though a backend may choose to make
+/// the two equal.
+///
+/// Lifetime is reference-counted: valid from the `lookup` that returns it
+/// until `forget` drops its count to zero (except `FUSE_ROOT_ID`, which is
+/// permanent). While live it is shared by every open handle onto the object,
+/// but it is not permanent: after a forget, a later lookup of the same object
+/// may return a different id. A distinct newtype from [`FileHandleId`] so the
+/// two can never be swapped by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InodeId(pub u64);
 

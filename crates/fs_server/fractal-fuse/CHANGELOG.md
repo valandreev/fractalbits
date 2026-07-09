@@ -4,6 +4,17 @@ All notable changes to `fractal-fuse` will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-09
+
+### Changed
+- **Breaking:** inode numbers and file handles are now distinct newtypes,
+  `InodeId` and `FileHandleId`, replacing the transparent `u64` aliases.
+  Every `Filesystem` trait method that took a `u64` inode or `fh` now
+  takes the corresponding newtype, and the `fh` fields of `ReplyOpen`,
+  `ReplyCreate`, and `SetAttr` are `FileHandleId`. The two cannot be
+  swapped by accident. Implementations reach the raw value with `.get()`
+  and wrap one with `InodeId::new` / `FileHandleId::new`.
+
 ## [0.5.0] - 2026-07-07
 
 ### Added
