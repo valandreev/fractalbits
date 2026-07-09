@@ -74,7 +74,7 @@ impl Filesystem for FuseServer {
         self.vfs.vfs_destroy();
     }
 
-    async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
+    async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
         match self.vfs.vfs_lookup(parent, name_str).await {
             Ok(attr) => Ok(ReplyEntry {
@@ -99,15 +99,15 @@ impl Filesystem for FuseServer {
         }
     }
 
-    fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
+    fn forget(&self, _req: Request, inode: InodeId, nlookup: u64) {
         self.vfs.vfs_forget(inode, nlookup);
     }
 
     async fn getattr(
         &self,
         _req: Request,
-        inode: u64,
-        fh: Option<u64>,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
         _flags: u32,
     ) -> FsResult<ReplyAttr> {
         let attr = self.vfs.vfs_getattr(inode, fh).await.map_err(fs_err)?;
@@ -120,8 +120,8 @@ impl Filesystem for FuseServer {
     async fn setattr(
         &self,
         req: Request,
-        inode: u64,
-        fh: Option<u64>,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
         set_attr: SetAttr,
     ) -> FsResult<ReplyAttr> {
         // POSIX setattr permission rules. We don't pass the FUSE
@@ -293,7 +293,7 @@ impl Filesystem for FuseServer {
         })
     }
 
-    async fn open(&self, req: Request, inode: u64, flags: u32) -> FsResult<ReplyOpen> {
+    async fn open(&self, req: Request, inode: InodeId, flags: u32) -> FsResult<ReplyOpen> {
         let fh = self.vfs.vfs_open(inode, flags).await.map_err(fs_err)?;
 
         // POSIX: a write(2) by a non-owner clears S_ISUID and (for
@@ -321,7 +321,7 @@ impl Filesystem for FuseServer {
                     .vfs_setattr_posix(inode, Some(new_mode), None, None, None, None, None)
                     .await
                 {
-                    tracing::warn!(inode, error = %e, "open: kill_suidgid setattr failed");
+                    tracing::warn!(inode = inode.0, error = %e, "open: kill_suidgid setattr failed");
                 }
             }
         }
@@ -344,8 +344,8 @@ impl Filesystem for FuseServer {
     async fn read(
         &self,
         _req: Request,
-        _inode: u64,
-        fh: u64,
+        _inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
@@ -355,8 +355,8 @@ impl Filesystem for FuseServer {
     async fn write(
         &self,
         _req: Request,
-        _inode: u64,
-        fh: u64,
+        _inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         data: &[u8],
         _write_flags: u32,
@@ -374,14 +374,26 @@ impl Filesystem for FuseServer {
         Ok(written as usize)
     }
 
-    async fn flush(&self, _req: Request, _inode: u64, fh: u64, _lock_owner: u64) -> FsResult<()> {
+    async fn flush(
+        &self,
+        _req: Request,
+        _inode: InodeId,
+        fh: FileHandleId,
+        _lock_owner: u64,
+    ) -> FsResult<()> {
         // FUSE_FLUSH fires on every close(2). Publish the buffered write
         // through to BSS+NSS synchronously so the data is durable and
         // visible to a read-after-close before close() returns.
         self.vfs.vfs_flush(fh).await.map_err(fs_err)
     }
 
-    async fn fsync(&self, _req: Request, _inode: u64, fh: u64, _datasync: bool) -> FsResult<()> {
+    async fn fsync(
+        &self,
+        _req: Request,
+        _inode: InodeId,
+        fh: FileHandleId,
+        _datasync: bool,
+    ) -> FsResult<()> {
         // fsync(2) is a durability request: publish the buffered write
         // through to BSS+NSS synchronously.
         self.vfs.vfs_flush(fh).await.map_err(fs_err)
@@ -390,8 +402,8 @@ impl Filesystem for FuseServer {
     async fn fallocate(
         &self,
         _req: Request,
-        _inode: u64,
-        fh: u64,
+        _inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         length: u64,
         mode: u32,
@@ -405,8 +417,8 @@ impl Filesystem for FuseServer {
     async fn lseek(
         &self,
         _req: Request,
-        _inode: u64,
-        fh: u64,
+        _inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         whence: u32,
     ) -> FsResult<u64> {
@@ -416,8 +428,8 @@ impl Filesystem for FuseServer {
     async fn release(
         &self,
         _req: Request,
-        _inode: u64,
-        fh: u64,
+        _inode: InodeId,
+        fh: FileHandleId,
         _flags: u32,
         _lock_owner: u64,
         _flush: bool,
@@ -433,7 +445,7 @@ impl Filesystem for FuseServer {
     async fn create(
         &self,
         req: Request,
-        parent: u64,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         _flags: u32,
@@ -456,7 +468,7 @@ impl Filesystem for FuseServer {
         })
     }
 
-    async fn unlink(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<()> {
+    async fn unlink(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<()> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
         self.vfs.vfs_unlink(parent, name_str).await.map_err(fs_err)
     }
@@ -464,7 +476,7 @@ impl Filesystem for FuseServer {
     async fn mknod(
         &self,
         req: Request,
-        parent: u64,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         rdev: u32,
@@ -507,7 +519,7 @@ impl Filesystem for FuseServer {
     async fn symlink(
         &self,
         req: Request,
-        parent: u64,
+        parent: InodeId,
         name: &OsStr,
         link: &OsStr,
     ) -> FsResult<ReplyEntry> {
@@ -527,7 +539,7 @@ impl Filesystem for FuseServer {
         })
     }
 
-    async fn readlink(&self, _req: Request, inode: u64) -> FsResult<ReplyReadlink> {
+    async fn readlink(&self, _req: Request, inode: InodeId) -> FsResult<ReplyReadlink> {
         let data = self.vfs.vfs_readlink(inode).await.map_err(fs_err)?;
         Ok(ReplyReadlink { data })
     }
@@ -535,8 +547,8 @@ impl Filesystem for FuseServer {
     async fn link(
         &self,
         _req: Request,
-        inode: u64,
-        new_parent: u64,
+        inode: InodeId,
+        new_parent: InodeId,
         new_name: &OsStr,
     ) -> FsResult<ReplyEntry> {
         let name_str = new_name.to_str().ok_or(libc::EINVAL)?;
@@ -555,7 +567,7 @@ impl Filesystem for FuseServer {
     async fn mkdir(
         &self,
         req: Request,
-        parent: u64,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         _umask: u32,
@@ -575,7 +587,7 @@ impl Filesystem for FuseServer {
         })
     }
 
-    async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<()> {
+    async fn rmdir(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<()> {
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
         self.vfs.vfs_rmdir(parent, name_str).await.map_err(fs_err)
     }
@@ -583,9 +595,9 @@ impl Filesystem for FuseServer {
     async fn rename(
         &self,
         _req: Request,
-        parent: u64,
+        parent: InodeId,
         name: &OsStr,
-        new_parent: u64,
+        new_parent: InodeId,
         new_name: &OsStr,
         _flags: u32,
     ) -> FsResult<()> {
@@ -597,7 +609,7 @@ impl Filesystem for FuseServer {
             .map_err(fs_err)
     }
 
-    async fn opendir(&self, _req: Request, inode: u64, _flags: u32) -> FsResult<ReplyOpen> {
+    async fn opendir(&self, _req: Request, inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
         let fh = self.vfs.vfs_opendir(inode).map_err(fs_err)?;
         Ok(ReplyOpen {
             fh,
@@ -609,8 +621,8 @@ impl Filesystem for FuseServer {
     async fn readdir(
         &self,
         _req: Request,
-        parent: u64,
-        _fh: u64,
+        parent: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
@@ -629,8 +641,8 @@ impl Filesystem for FuseServer {
     async fn readdirplus(
         &self,
         _req: Request,
-        parent: u64,
-        _fh: u64,
+        parent: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
@@ -653,15 +665,21 @@ impl Filesystem for FuseServer {
             .collect())
     }
 
-    async fn releasedir(&self, _req: Request, _inode: u64, _fh: u64, _flags: u32) -> FsResult<()> {
+    async fn releasedir(
+        &self,
+        _req: Request,
+        _inode: InodeId,
+        _fh: FileHandleId,
+        _flags: u32,
+    ) -> FsResult<()> {
         Ok(())
     }
 
     async fn fsyncdir(
         &self,
         _req: Request,
-        _inode: u64,
-        _fh: u64,
+        _inode: InodeId,
+        _fh: FileHandleId,
         _datasync: bool,
     ) -> FsResult<()> {
         // Directory metadata is published synchronously, so there is
@@ -669,7 +687,7 @@ impl Filesystem for FuseServer {
         Ok(())
     }
 
-    async fn statfs(&self, _req: Request, _inode: u64) -> FsResult<ReplyStatfs> {
+    async fn statfs(&self, _req: Request, _inode: InodeId) -> FsResult<ReplyStatfs> {
         let s = self.vfs.vfs_statfs();
         Ok(ReplyStatfs {
             blocks: s.blocks,

@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use data_types::TraceId;
+use fractal_fuse::{FileHandleId, InodeId};
 use rkyv::api::high::to_bytes_in;
 use std::cell::Cell;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -206,7 +207,7 @@ impl WriteBuffer {
 }
 
 struct FileHandle {
-    ino: u64,
+    ino: InodeId,
     s3_key: String,
     layout: Option<ObjectLayout>,
     write_buf: Option<WriteBuffer>,
@@ -303,7 +304,7 @@ pub struct VfsCore {
     inodes: Arc<InodeTable>,
     disk_cache: Option<Arc<DiskCache>>,
     dir_cache: DirCache,
-    file_handles: DashMap<u64, FileHandle>,
+    file_handles: DashMap<FileHandleId, FileHandle>,
     next_fh: AtomicU64,
     read_write: bool,
     passthrough_enabled: bool,
@@ -312,12 +313,12 @@ pub struct VfsCore {
     fuse_dev_fd: Option<Arc<OwnedFd>>,
     // Tracks blob data for unlinked files that still have open handles.
     // Cleanup is deferred until the last handle is released.
-    deferred_blob_cleanup: DashMap<u64, Bytes>,
-    // Inode-scoped write lock. At most one write-mode handle per inode is
+    deferred_blob_cleanup: DashMap<InodeId, Bytes>,
+    // InodeId-scoped write lock. At most one write-mode handle per inode is
     // allowed. Map value is the owning fh so a stale lock for a closed fh
     // can be reclaimed by the next opener. Reads do not touch
     // this lock.
-    inode_write_owner: DashMap<u64, u64>,
+    inode_write_owner: DashMap<InodeId, FileHandleId>,
     // Handle to the dedicated disk-cache mirror thread. `None` when the
     // disk cache is disabled or the mirror thread failed to start. Keeps
     // the best-effort local-cache write off the FUSE worker threads so it
@@ -416,20 +417,20 @@ impl VfsCore {
         })
     }
 
-    fn alloc_fh(&self) -> u64 {
-        self.next_fh.fetch_add(1, Ordering::Relaxed)
+    fn alloc_fh(&self) -> FileHandleId {
+        FileHandleId(self.next_fh.fetch_add(1, Ordering::Relaxed))
     }
 
-    fn dir_prefix(&self, ino: u64) -> Option<String> {
+    fn dir_prefix(&self, ino: InodeId) -> Option<String> {
         self.inodes.get_s3_key(ino)
     }
 
-    fn cache_dir_entry(&self, prefix: &str, name: &str, ino: u64, kind: DirEntryKind) {
+    fn cache_dir_entry(&self, prefix: &str, name: &str, ino: InodeId, kind: DirEntryKind) {
         self.dir_cache.upsert(
             prefix,
             DirEntry {
                 name: name.to_string(),
-                ino,
+                ino: ino.0,
                 kind,
             },
         );
@@ -456,7 +457,7 @@ impl VfsCore {
         Ok(())
     }
 
-    fn has_open_handles_for_inode(&self, ino: u64, exclude_fh: Option<u64>) -> bool {
+    fn has_open_handles_for_inode(&self, ino: InodeId, exclude_fh: Option<FileHandleId>) -> bool {
         self.file_handles.iter().any(|entry| {
             entry.value().ino == ino && exclude_fh.is_none_or(|excl| *entry.key() != excl)
         })
@@ -469,7 +470,7 @@ impl VfsCore {
     /// `file_handles`), the lock is stale and we take it. This recovers from
     /// any path that removes a handle without first calling
     /// `release_write_lock` (e.g. lookup races during shutdown).
-    fn acquire_write_lock(&self, inode: u64, fh: u64) -> Result<(), FsError> {
+    fn acquire_write_lock(&self, inode: InodeId, fh: FileHandleId) -> Result<(), FsError> {
         use dashmap::mapref::entry::Entry;
         match self.inode_write_owner.entry(inode) {
             Entry::Vacant(slot) => {
@@ -496,7 +497,11 @@ impl VfsCore {
     /// spuriously EBUSY (observed in truncate/O_TRUNC tests once per-flush
     /// latency grew). A genuinely concurrent writer keeps its handle open
     /// past the budget and still gets EBUSY.
-    async fn acquire_write_lock_retry(&self, inode: u64, fh: u64) -> Result<(), FsError> {
+    async fn acquire_write_lock_retry(
+        &self,
+        inode: InodeId,
+        fh: FileHandleId,
+    ) -> Result<(), FsError> {
         if self.acquire_write_lock(inode, fh).is_ok() {
             return Ok(());
         }
@@ -514,7 +519,7 @@ impl VfsCore {
         Err(FsError::Busy)
     }
 
-    fn release_write_lock(&self, inode: u64, fh: u64) {
+    fn release_write_lock(&self, inode: InodeId, fh: FileHandleId) {
         self.inode_write_owner
             .remove_if(&inode, |_, owner| *owner == fh);
     }
@@ -529,7 +534,7 @@ impl VfsCore {
 
     // ── Attribute builders ──
 
-    fn make_file_attr(&self, ino: u64, layout: &ObjectLayout) -> Result<VfsAttr, FsError> {
+    fn make_file_attr(&self, ino: InodeId, layout: &ObjectLayout) -> Result<VfsAttr, FsError> {
         let size = layout.size()?;
         let ts = layout.timestamp / 1000;
         // Symlinks share the regular-file attribute path but report
@@ -590,7 +595,7 @@ impl VfsCore {
             (ts, 0u32)
         };
         let attr = VfsAttr {
-            ino,
+            ino: ino.0,
             size,
             blocks: if is_symlink || special.is_some() {
                 0
@@ -620,9 +625,9 @@ impl VfsCore {
     /// Fallback file attr when layout is unavailable (e.g., inode evicted
     /// between fetch_dir_entries and readdirplus iteration). Uses correct
     /// kind=RegularFile to avoid on-wire inconsistency.
-    fn make_default_file_attr(&self, ino: u64) -> VfsAttr {
+    fn make_default_file_attr(&self, ino: InodeId) -> VfsAttr {
         VfsAttr {
-            ino,
+            ino: ino.0,
             size: 0,
             blocks: 0,
             atime_secs: 0,
@@ -640,7 +645,7 @@ impl VfsCore {
         }
     }
 
-    fn make_dir_attr(&self, ino: u64) -> VfsAttr {
+    fn make_dir_attr(&self, ino: InodeId) -> VfsAttr {
         let posix = self.inodes.get(ino).map(|e| e.posix).unwrap_or_default();
         // FUSE root inode reports mode 0o777 unconditionally so the
         // kernel's permission check lets every caller into the mount;
@@ -661,7 +666,7 @@ impl VfsCore {
         let ctime_secs = posix.ctime_ns / 1_000_000_000;
         let ctime_ns_part = (posix.ctime_ns % 1_000_000_000) as u32;
         let attr = VfsAttr {
-            ino,
+            ino: ino.0,
             size: 0,
             blocks: 0,
             atime_secs: mtime_secs,
@@ -690,7 +695,7 @@ impl VfsCore {
         self.apply_atime_override(ino, attr)
     }
 
-    fn make_new_file_attr(&self, ino: u64, size: u64) -> VfsAttr {
+    fn make_new_file_attr(&self, ino: InodeId, size: u64) -> VfsAttr {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -720,7 +725,7 @@ impl VfsCore {
             (now_secs, 0u32)
         };
         let attr = VfsAttr {
-            ino,
+            ino: ino.0,
             size,
             blocks: size.div_ceil(512),
             atime_secs: mtime_secs,
@@ -742,7 +747,7 @@ impl VfsCore {
     /// Layer an explicit `utimensat`-set atime (held in
     /// `InodeEntry.atime_ns`, volatile) on top of the mtime-mirrored
     /// atime the builders emit. No-op when no override is set.
-    fn apply_atime_override(&self, ino: u64, mut attr: VfsAttr) -> VfsAttr {
+    fn apply_atime_override(&self, ino: InodeId, mut attr: VfsAttr) -> VfsAttr {
         if let Some(entry) = self.inodes.get(ino)
             && entry.atime_ns != 0
         {
@@ -756,7 +761,7 @@ impl VfsCore {
 
     /// Try to set up passthrough for a file handle. Returns (open_flags, backing_id)
     /// if passthrough is activated, or (0, 0) otherwise.
-    pub fn try_passthrough(&self, fh: u64, layout: &ObjectLayout) -> (u32, i32) {
+    pub fn try_passthrough(&self, fh: FileHandleId, layout: &ObjectLayout) -> (u32, i32) {
         if !self.passthrough_enabled {
             return (0, 0);
         }
@@ -812,7 +817,7 @@ impl VfsCore {
 
         match fractal_fuse::passthrough::fuse_backing_open(fuse_fd, backing_fd) {
             Ok(bid) => {
-                tracing::info!(fh, backing_id = bid, "passthrough activated");
+                tracing::info!(fh = fh.0, backing_id = bid, "passthrough activated");
                 // Store backing_id in file handle for cleanup
                 if let Some(mut handle) = self.file_handles.get_mut(&fh) {
                     handle.backing_id = Some(bid);
@@ -827,14 +832,14 @@ impl VfsCore {
     }
 
     /// Try passthrough for an already-opened file handle.
-    pub fn try_passthrough_for_fh(&self, fh: u64) -> Option<(u32, i32)> {
+    pub fn try_passthrough_for_fh(&self, fh: FileHandleId) -> Option<(u32, i32)> {
         let handle = self.file_handles.get(&fh)?;
         let layout = handle.layout.as_ref()?;
         Some(self.try_passthrough(fh, layout))
     }
 
     /// Clean up passthrough backing_id on file release.
-    pub fn release_passthrough(&self, fh: u64) {
+    pub fn release_passthrough(&self, fh: FileHandleId) {
         let backing_id = self.file_handles.get(&fh).and_then(|h| h.backing_id);
 
         if let Some(bid) = backing_id
@@ -1179,7 +1184,12 @@ impl VfsCore {
     ///
     /// Tries to read from disk cache directly into `buf`. For cache misses
     /// or unsupported object states, falls back to the Bytes path internally.
-    pub async fn vfs_read(&self, fh: u64, offset: u64, buf: &mut [u8]) -> Result<usize, FsError> {
+    pub async fn vfs_read(
+        &self,
+        fh: FileHandleId,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, FsError> {
         let handle = self.file_handles.get(&fh).ok_or(FsError::BadFd)?;
 
         // Dirty write buffer: merge per-block intents over the committed
@@ -1358,7 +1368,7 @@ impl VfsCore {
     /// write is silently lost. Re-inserts without clobbering newer writes.
     fn restore_flush_snapshot(
         &self,
-        fh_id: u64,
+        fh_id: FileHandleId,
         blocks: std::collections::BTreeMap<u32, BlockState>,
         pending_reservations: std::collections::BTreeSet<u32>,
     ) {
@@ -1375,7 +1385,7 @@ impl VfsCore {
         }
     }
 
-    async fn flush_write_buffer(&self, fh_id: u64) -> Result<(), FsError> {
+    async fn flush_write_buffer(&self, fh_id: FileHandleId) -> Result<(), FsError> {
         // Snapshot the sparse buffer under the guard and clear `dirty` so a
         // concurrent flush of the same fh sees a clean buffer and
         // early-returns rather than racing in to republish.
@@ -1960,13 +1970,13 @@ impl VfsCore {
 
     async fn fetch_dir_entries(
         &self,
-        parent: u64,
+        parent: InodeId,
         prefix: &str,
     ) -> Result<Arc<Vec<DirEntry>>, FsError> {
         if let Some(cached) = self.dir_cache.get(prefix) {
             let stale = cached
                 .iter()
-                .any(|entry| self.inodes.get(entry.ino).is_none());
+                .any(|entry| self.inodes.get(InodeId(entry.ino)).is_none());
             if !stale {
                 return Ok(cached);
             }
@@ -2001,12 +2011,12 @@ impl VfsCore {
 
         all_entries.push(DirEntry {
             name: ".".to_string(),
-            ino: parent,
+            ino: parent.0,
             kind: DirEntryKind::Directory,
         });
         all_entries.push(DirEntry {
             name: "..".to_string(),
-            ino: dotdot_ino,
+            ino: dotdot_ino.0,
             kind: DirEntryKind::Directory,
         });
 
@@ -2046,7 +2056,7 @@ impl VfsCore {
                             .lookup_or_insert(raw_key, EntryType::File, entry.layout);
                     all_entries.push(DirEntry {
                         name: name.to_string(),
-                        ino,
+                        ino: ino.0,
                         kind,
                     });
                 } else {
@@ -2061,7 +2071,7 @@ impl VfsCore {
                             .lookup_or_insert(&dir_key, EntryType::Directory, None);
                     all_entries.push(DirEntry {
                         name: dir_name.to_string(),
-                        ino,
+                        ino: ino.0,
                         kind: DirEntryKind::Directory,
                     });
                 }
@@ -2126,7 +2136,7 @@ impl VfsCore {
     /// the immediately-following getattr reads it from the cached
     /// entry, and the parent's persisted layout is unaffected. Root
     /// has no inode entry of its own, so skip it.
-    fn touch_parent_times(&self, parent: u64) {
+    fn touch_parent_times(&self, parent: InodeId) {
         if parent == ROOT_INODE {
             return;
         }
@@ -2232,8 +2242,8 @@ impl VfsCore {
     /// (EISDIR here).
     pub async fn vfs_link(
         &self,
-        inode: u64,
-        new_parent: u64,
+        inode: InodeId,
+        new_parent: InodeId,
         new_name: &str,
     ) -> Result<VfsAttr, FsError> {
         self.check_write_enabled()?;
@@ -2503,7 +2513,7 @@ impl VfsCore {
         Ok(attr)
     }
 
-    pub async fn vfs_lookup(&self, parent: u64, name: &str) -> Result<VfsAttr, FsError> {
+    pub async fn vfs_lookup(&self, parent: InodeId, name: &str) -> Result<VfsAttr, FsError> {
         Self::check_name_max(name)?;
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
         Self::check_path_max(&prefix, name)?;
@@ -2640,11 +2650,15 @@ impl VfsCore {
         }
     }
 
-    pub fn vfs_forget(&self, inode: u64, nlookup: u64) {
+    pub fn vfs_forget(&self, inode: InodeId, nlookup: u64) {
         self.inodes.forget(inode, nlookup);
     }
 
-    pub async fn vfs_getattr(&self, inode: u64, fh: Option<u64>) -> Result<VfsAttr, FsError> {
+    pub async fn vfs_getattr(
+        &self,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
+    ) -> Result<VfsAttr, FsError> {
         if inode == ROOT_INODE {
             return Ok(self.make_dir_attr(ROOT_INODE));
         }
@@ -2806,14 +2820,14 @@ impl VfsCore {
     /// in-memory attr fast path below can't see that nlink, so a caller
     /// that replies an attr to the kernel must resolve the record for
     /// these (otherwise it clobbers the kernel's cached link count to 1).
-    pub fn is_hardlink(&self, inode: u64) -> bool {
+    pub fn is_hardlink(&self, inode: InodeId) -> bool {
         self.inodes
             .get(inode)
             .map(|e| e.inode_id.is_some())
             .unwrap_or(false)
     }
 
-    pub fn is_dir(&self, inode: u64) -> bool {
+    pub fn is_dir(&self, inode: InodeId) -> bool {
         self.inodes
             .get(inode)
             .map(|e| e.entry_type == EntryType::Directory)
@@ -2827,7 +2841,7 @@ impl VfsCore {
     /// Normal marker / implicit directory keeps its default). Guarded on
     /// `!posix_known` again after the fetch so a concurrent local posix
     /// mutation is never clobbered.
-    async fn refresh_dir_posix_if_unknown(&self, inode: u64) {
+    async fn refresh_dir_posix_if_unknown(&self, inode: InodeId) {
         let dir_key = match self.inodes.get(inode) {
             Some(e) if e.entry_type == EntryType::Directory && !e.posix_known => e.s3_key.clone(),
             _ => return,
@@ -2843,7 +2857,11 @@ impl VfsCore {
         }
     }
 
-    pub fn vfs_getattr_inmem(&self, inode: u64, fh: Option<u64>) -> Result<VfsAttr, FsError> {
+    pub fn vfs_getattr_inmem(
+        &self,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
+    ) -> Result<VfsAttr, FsError> {
         if inode == ROOT_INODE {
             return Ok(self.make_dir_attr(ROOT_INODE));
         }
@@ -2883,8 +2901,8 @@ impl VfsCore {
     /// Handle size changes via setattr (truncate, extend, or truncate-to-zero).
     pub async fn vfs_setattr_size(
         &self,
-        inode: u64,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         new_size: u64,
     ) -> Result<VfsAttr, FsError> {
         // A negative ftruncate length wraps to a near-u64::MAX value;
@@ -3039,7 +3057,7 @@ impl VfsCore {
     #[allow(clippy::too_many_arguments)]
     pub async fn vfs_setattr_posix(
         &self,
-        inode: u64,
+        inode: InodeId,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -3199,7 +3217,7 @@ impl VfsCore {
     /// open fd.
     pub async fn vfs_mknod(
         &self,
-        parent: u64,
+        parent: InodeId,
         name: &str,
         kind: SpecialKind,
         rdev: u32,
@@ -3275,7 +3293,7 @@ impl VfsCore {
         self.make_file_attr(ino, &layout)
     }
 
-    pub async fn vfs_open(&self, inode: u64, flags: u32) -> Result<u64, FsError> {
+    pub async fn vfs_open(&self, inode: InodeId, flags: u32) -> Result<FileHandleId, FsError> {
         let write_flags = libc::O_WRONLY as u32
             | libc::O_RDWR as u32
             | libc::O_APPEND as u32
@@ -3479,7 +3497,12 @@ impl VfsCore {
         Ok(fh)
     }
 
-    pub async fn vfs_write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
+    pub async fn vfs_write(
+        &self,
+        fh: FileHandleId,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32, FsError> {
         // POSIX: zero-byte writes are a no-op and must NOT extend the
         // file. Early return also avoids the `end - 1` underflow below.
         if data.is_empty() {
@@ -3626,7 +3649,7 @@ impl VfsCore {
 
     pub async fn vfs_fallocate(
         &self,
-        fh: u64,
+        fh: FileHandleId,
         offset: u64,
         length: u64,
         mode: u32,
@@ -3856,7 +3879,12 @@ impl VfsCore {
     /// into the inode via `put_inode_cas`, so no separate BSS geometry probe
     /// is needed). Per-block classification merges buffer state with a single
     /// bounded `ListBlobBlocks` probe (present => data, absent => hole).
-    pub async fn vfs_lseek(&self, fh: u64, offset: u64, whence: u32) -> Result<u64, FsError> {
+    pub async fn vfs_lseek(
+        &self,
+        fh: FileHandleId,
+        offset: u64,
+        whence: u32,
+    ) -> Result<u64, FsError> {
         let seek_data = whence == libc::SEEK_DATA as u32;
         let seek_hole = whence == libc::SEEK_HOLE as u32;
         if !seek_data && !seek_hole {
@@ -3980,14 +4008,14 @@ impl VfsCore {
         }
     }
 
-    pub async fn vfs_flush(&self, fh: u64) -> Result<(), FsError> {
+    pub async fn vfs_flush(&self, fh: FileHandleId) -> Result<(), FsError> {
         // Synchronous write-through: the buffered data is published to
         // BSS / NSS inline, so this is also the durability barrier used
         // by fsync(2) / O_SYNC.
         self.flush_write_buffer(fh).await
     }
 
-    pub async fn vfs_release(&self, fh: u64) -> Result<(), FsError> {
+    pub async fn vfs_release(&self, fh: FileHandleId) -> Result<(), FsError> {
         // Flush any dirty write buffer before releasing
         let (has_dirty, was_writer) = self
             .file_handles
@@ -4052,12 +4080,12 @@ impl VfsCore {
 
     pub async fn vfs_create(
         &self,
-        parent: u64,
+        parent: InodeId,
         name: &str,
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> Result<(VfsAttr, u64), FsError> {
+    ) -> Result<(VfsAttr, FileHandleId), FsError> {
         self.check_write_enabled()?;
         Self::check_name_max(name)?;
 
@@ -4122,7 +4150,7 @@ impl VfsCore {
     /// fail the create with `AlreadyExists`.
     pub async fn vfs_symlink(
         &self,
-        parent: u64,
+        parent: InodeId,
         name: &str,
         target: &[u8],
         uid: u32,
@@ -4201,7 +4229,7 @@ impl VfsCore {
     /// Return the bytes a `readlink(2)` should hand back. Returns
     /// `InvalidArgument` (EINVAL) when the inode is not a symlink,
     /// matching the `readlink(2)` errno for non-symlink targets.
-    pub async fn vfs_readlink(&self, inode: u64) -> Result<Vec<u8>, FsError> {
+    pub async fn vfs_readlink(&self, inode: InodeId) -> Result<Vec<u8>, FsError> {
         let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
 
         if entry.entry_type != EntryType::File {
@@ -4248,7 +4276,7 @@ impl VfsCore {
     async fn cleanup_orphaned_value(
         &self,
         key: &str,
-        ino_hint: Option<u64>,
+        ino_hint: Option<InodeId>,
         old_bytes: Bytes,
         trace_id: &TraceId,
     ) {
@@ -4350,7 +4378,7 @@ impl VfsCore {
         }
     }
 
-    pub async fn vfs_unlink(&self, parent: u64, name: &str) -> Result<(), FsError> {
+    pub async fn vfs_unlink(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
         self.check_write_enabled()?;
         Self::check_name_max(name)?;
 
@@ -4394,7 +4422,7 @@ impl VfsCore {
 
     pub async fn vfs_mkdir(
         &self,
-        parent: u64,
+        parent: InodeId,
         name: &str,
         mode: u32,
         uid: u32,
@@ -4439,13 +4467,14 @@ impl VfsCore {
             .await?;
 
         self.cache_dir_entry(&prefix, name, ino, DirEntryKind::Directory);
-        self.dir_cache.insert_empty_dir(key.clone(), ino, parent);
+        self.dir_cache
+            .insert_empty_dir(key.clone(), ino.0, parent.0);
         self.touch_parent_times(parent);
 
         Ok(self.make_dir_attr(ino))
     }
 
-    pub async fn vfs_rmdir(&self, parent: u64, name: &str) -> Result<(), FsError> {
+    pub async fn vfs_rmdir(&self, parent: InodeId, name: &str) -> Result<(), FsError> {
         self.check_write_enabled()?;
         Self::check_name_max(name)?;
 
@@ -4513,9 +4542,9 @@ impl VfsCore {
 
     pub async fn vfs_rename(
         &self,
-        parent: u64,
+        parent: InodeId,
         name: &str,
-        new_parent: u64,
+        new_parent: InodeId,
         new_name: &str,
     ) -> Result<(), FsError> {
         self.check_write_enabled()?;
@@ -4623,7 +4652,7 @@ impl VfsCore {
         Ok(())
     }
 
-    pub fn vfs_opendir(&self, inode: u64) -> Result<u64, FsError> {
+    pub fn vfs_opendir(&self, inode: InodeId) -> Result<FileHandleId, FsError> {
         if inode != ROOT_INODE {
             let entry = self.inodes.get(inode).ok_or(FsError::NotFound)?;
             if entry.entry_type != EntryType::Directory {
@@ -4634,7 +4663,11 @@ impl VfsCore {
         Ok(self.alloc_fh())
     }
 
-    pub async fn vfs_readdir(&self, parent: u64, offset: u64) -> Result<Vec<VfsDirEntry>, FsError> {
+    pub async fn vfs_readdir(
+        &self,
+        parent: InodeId,
+        offset: u64,
+    ) -> Result<Vec<VfsDirEntry>, FsError> {
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
         let dir_entries = self.fetch_dir_entries(parent, &prefix).await?;
 
@@ -4656,7 +4689,7 @@ impl VfsCore {
 
     pub async fn vfs_readdirplus(
         &self,
-        parent: u64,
+        parent: InodeId,
         offset: u64,
     ) -> Result<Vec<VfsDirEntryPlus>, FsError> {
         let prefix = self.dir_prefix(parent).ok_or(FsError::NotFound)?;
@@ -4671,11 +4704,11 @@ impl VfsCore {
         // later stat/chmod then sees the placeholder owner). Concurrent to
         // bound the cost on a cold `ls` of a many-subdir directory; a
         // posix-known entry is skipped, so repeat listings pay nothing.
-        let unknown_dirs: Vec<u64> = dir_entries
+        let unknown_dirs: Vec<InodeId> = dir_entries
             .iter()
             .skip(offset)
             .filter(|e| e.kind.is_dir())
-            .map(|e| e.ino)
+            .map(|e| InodeId(e.ino))
             .filter(|&ino| {
                 self.inodes
                     .get(ino)
@@ -4702,7 +4735,7 @@ impl VfsCore {
             std::collections::HashMap::new();
         for (idx, entry) in dir_entries.iter().skip(offset).enumerate() {
             let attr = if entry.kind.is_dir() {
-                self.make_dir_attr(entry.ino)
+                self.make_dir_attr(InodeId(entry.ino))
             } else {
                 // Clone the cached layout out (dropping the map guard before
                 // any await), then resolve a hardlink redirect to the shared
@@ -4712,7 +4745,7 @@ impl VfsCore {
                 // EINVAL on the first `ls` of a directory holding a hardlink.
                 let (cached_layout, cached_id) = self
                     .inodes
-                    .get(entry.ino)
+                    .get(InodeId(entry.ino))
                     .map(|e| (e.layout.clone(), e.inode_id))
                     .unwrap_or((None, None));
                 match cached_layout {
@@ -4745,19 +4778,19 @@ impl VfsCore {
                         // below reports the record's mode/uid/gid/times
                         // rather than stale cached defaults.
                         if let Some(id) = resolved_id
-                            && let Some(mut e) = self.inodes.get_mut(entry.ino)
+                            && let Some(mut e) = self.inodes.get_mut(InodeId(entry.ino))
                         {
                             e.inode_id = Some(id);
                             e.posix = crate::inode::layout_posix(&resolved);
                             e.layout = Some(resolved.clone());
                         }
-                        let mut attr = self.make_file_attr(entry.ino, &resolved)?;
+                        let mut attr = self.make_file_attr(InodeId(entry.ino), &resolved)?;
                         // resolve_indirect returns the record's true link
                         // count; the redirect layout carries none.
                         attr.nlink = nlink;
                         attr
                     }
-                    None => self.make_default_file_attr(entry.ino),
+                    None => self.make_default_file_attr(InodeId(entry.ino)),
                 }
             };
             entries.push(VfsDirEntryPlus {

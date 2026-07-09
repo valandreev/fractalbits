@@ -2,8 +2,56 @@ use std::time::Duration;
 
 use crate::abi;
 
-pub type Inode = u64;
 pub type Errno = i32;
+
+/// A FUSE inode number (`nodeid` on the wire).
+///
+/// Identifies a filesystem object (file, directory, symlink, device node).
+/// Stable across opens and shared by every handle onto the same object; this
+/// is what `lookup` resolves a name to. A distinct newtype from
+/// [`FileHandleId`] so the two can never be swapped by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct InodeId(pub u64);
+
+impl InodeId {
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for InodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// An open file or directory handle id (`fh` on the wire).
+///
+/// Identifies a single open instance: minted by `open` / `opendir` /
+/// `create` and torn down by `release`. Many handles can point at one
+/// [`InodeId`]; each carries its own per-open state (offset, flags, buffers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileHandleId(pub u64);
+
+impl FileHandleId {
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for FileHandleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 // Standard errno values
 pub const ENOSYS: Errno = libc::ENOSYS;
@@ -174,7 +222,7 @@ pub struct SetAttr {
     pub atime: Option<SetAttrTime>,
     pub mtime: Option<SetAttrTime>,
     pub ctime: Option<Timestamp>,
-    pub fh: Option<u64>,
+    pub fh: Option<FileHandleId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -233,7 +281,7 @@ impl SetAttr {
                 None
             },
             fh: if valid & abi::FATTR_FH != 0 {
-                Some(raw.fh)
+                Some(FileHandleId(raw.fh))
             } else {
                 None
             },
@@ -286,7 +334,7 @@ pub struct ReplyAttr {
 
 #[derive(Debug)]
 pub struct ReplyOpen {
-    pub fh: u64,
+    pub fh: FileHandleId,
     pub flags: u32,
     pub backing_id: i32,
 }
@@ -296,7 +344,7 @@ pub struct ReplyCreate {
     pub ttl: Duration,
     pub attr: FileAttr,
     pub generation: u64,
-    pub fh: u64,
+    pub fh: FileHandleId,
     pub flags: u32,
 }
 

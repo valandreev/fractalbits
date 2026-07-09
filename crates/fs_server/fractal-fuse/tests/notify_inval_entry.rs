@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
-    ENOENT, FileAttr, FileType, Filesystem, FsResult, FuseNotifier, MountOptions, ReplyAttr,
-    ReplyEntry, Request, Session, Timestamp,
+    ENOENT, FileAttr, FileHandleId, FileType, Filesystem, FsResult, FuseNotifier, InodeId,
+    MountOptions, ReplyAttr, ReplyEntry, Request, Session, Timestamp,
 };
 
 const WATCHED_INO: u64 = 2;
@@ -85,8 +85,8 @@ struct CountingFs {
 }
 
 impl Filesystem for CountingFs {
-    async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
-        if parent == FUSE_ROOT_ID && name == WATCHED_NAME {
+    async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
+        if parent.0 == FUSE_ROOT_ID && name == WATCHED_NAME {
             self.watched_lookups.fetch_add(1, Ordering::SeqCst);
             Ok(ReplyEntry {
                 ttl: TTL,
@@ -101,11 +101,11 @@ impl Filesystem for CountingFs {
     async fn getattr(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: Option<u64>,
+        inode: InodeId,
+        _fh: Option<FileHandleId>,
         _flags: u32,
     ) -> FsResult<ReplyAttr> {
-        match inode {
+        match inode.0 {
             FUSE_ROOT_ID => Ok(ReplyAttr {
                 ttl: TTL,
                 attr: dir_attr(FUSE_ROOT_ID),

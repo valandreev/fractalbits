@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
-    DirectoryEntry, DirectoryEntryPlus, ENOENT, FileAttr, FileType, Filesystem, FsResult,
-    MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Session, Timestamp,
+    DirectoryEntry, DirectoryEntryPlus, ENOENT, FileAttr, FileHandleId, FileType, Filesystem,
+    FsResult, InodeId, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
+    Session, Timestamp,
 };
 
 const HELLO_INO: u64 = 2;
@@ -72,7 +73,8 @@ fn hello_attr() -> FileAttr {
 struct HelloFs;
 
 impl Filesystem for HelloFs {
-    async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
+    async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
+        let parent = parent.0;
         if parent == FUSE_ROOT_ID && name == "hello" {
             Ok(ReplyEntry {
                 ttl: TTL,
@@ -87,11 +89,11 @@ impl Filesystem for HelloFs {
     async fn getattr(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: Option<u64>,
+        inode: InodeId,
+        _fh: Option<FileHandleId>,
         _flags: u32,
     ) -> FsResult<ReplyAttr> {
-        match inode {
+        match inode.0 {
             FUSE_ROOT_ID => Ok(ReplyAttr {
                 ttl: TTL,
                 attr: root_attr(),
@@ -104,10 +106,10 @@ impl Filesystem for HelloFs {
         }
     }
 
-    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> FsResult<ReplyOpen> {
-        if inode == HELLO_INO {
+    async fn open(&self, _req: Request, inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
+        if inode.0 == HELLO_INO {
             Ok(ReplyOpen {
-                fh: 0,
+                fh: FileHandleId(0),
                 flags: 0,
                 backing_id: 0,
             })
@@ -119,12 +121,12 @@ impl Filesystem for HelloFs {
     async fn read(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: u64,
+        inode: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        if inode != HELLO_INO {
+        if inode.0 != HELLO_INO {
             return Err(ENOENT);
         }
         let offset = offset as usize;
@@ -140,12 +142,12 @@ impl Filesystem for HelloFs {
     async fn readdir(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: u64,
+        inode: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
-        if inode != FUSE_ROOT_ID {
+        if inode.0 != FUSE_ROOT_ID {
             return Err(ENOENT);
         }
         let entries = vec![
@@ -174,12 +176,12 @@ impl Filesystem for HelloFs {
     async fn readdirplus(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: u64,
+        inode: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
-        if inode != FUSE_ROOT_ID {
+        if inode.0 != FUSE_ROOT_ID {
             return Err(ENOENT);
         }
         let entries = vec![
@@ -214,15 +216,15 @@ impl Filesystem for HelloFs {
         Ok(entries.into_iter().filter(|e| e.offset > offset).collect())
     }
 
-    async fn opendir(&self, _req: Request, _inode: u64, _flags: u32) -> FsResult<ReplyOpen> {
+    async fn opendir(&self, _req: Request, _inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
         Ok(ReplyOpen {
-            fh: 0,
+            fh: FileHandleId(0),
             flags: 0,
             backing_id: 0,
         })
     }
 
-    async fn statfs(&self, _req: Request, _inode: u64) -> FsResult<ReplyStatfs> {
+    async fn statfs(&self, _req: Request, _inode: InodeId) -> FsResult<ReplyStatfs> {
         Ok(ReplyStatfs {
             blocks: 0,
             bfree: 0,
@@ -235,7 +237,7 @@ impl Filesystem for HelloFs {
         })
     }
 
-    async fn access(&self, _req: Request, _inode: u64, _mask: u32) -> FsResult<()> {
+    async fn access(&self, _req: Request, _inode: InodeId, _mask: u32) -> FsResult<()> {
         Ok(())
     }
 }

@@ -46,7 +46,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn lookup(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<ReplyEntry>> {
         let _ = (req, parent, name);
@@ -59,7 +59,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// `nlookup` is the number of references to drop. The filesystem should
     /// not return errors; after this call, the inode may be evicted if no
     /// references remain.
-    fn forget(&self, req: Request, inode: Inode, nlookup: u64) {
+    fn forget(&self, req: Request, inode: InodeId, nlookup: u64) {
         let _ = (req, inode, nlookup);
     }
 
@@ -67,7 +67,7 @@ pub trait Filesystem: Send + Sync + 'static {
     ///
     /// Each element in `inodes` is an `(inode, nlookup)` pair. The default
     /// implementation delegates to `forget` for each entry.
-    fn batch_forget(&self, req: Request, inodes: &[(Inode, u64)]) {
+    fn batch_forget(&self, req: Request, inodes: &[(InodeId, u64)]) {
         for &(inode, nlookup) in inodes {
             self.forget(req, inode, nlookup);
         }
@@ -82,8 +82,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn getattr(
         &self,
         req: Request,
-        inode: Inode,
-        fh: Option<u64>,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
         flags: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyAttr>> {
         let _ = (req, inode, fh, flags);
@@ -99,8 +99,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn statx(
         &self,
         req: Request,
-        inode: Inode,
-        fh: Option<u64>,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
         flags: u32,
         mask: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyStatx>> {
@@ -116,8 +116,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn setattr(
         &self,
         req: Request,
-        inode: Inode,
-        fh: Option<u64>,
+        inode: InodeId,
+        fh: Option<FileHandleId>,
         set_attr: SetAttr,
     ) -> impl std::future::Future<Output = FsResult<ReplyAttr>> {
         let _ = (req, inode, fh, set_attr);
@@ -128,7 +128,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn readlink(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
     ) -> impl std::future::Future<Output = FsResult<ReplyReadlink>> {
         let _ = (req, inode);
         async { Err(ENOSYS) }
@@ -141,7 +141,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn symlink(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
         link: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<ReplyEntry>> {
@@ -156,7 +156,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn mknod(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         rdev: u32,
@@ -172,7 +172,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn mkdir(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         umask: u32,
@@ -188,7 +188,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn unlink(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, parent, name);
@@ -199,7 +199,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn rmdir(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, parent, name);
@@ -214,9 +214,9 @@ pub trait Filesystem: Send + Sync + 'static {
     fn rename(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
-        new_parent: Inode,
+        new_parent: InodeId,
         new_name: &OsStr,
         flags: u32,
     ) -> impl std::future::Future<Output = FsResult<()>> {
@@ -231,8 +231,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn link(
         &self,
         req: Request,
-        inode: Inode,
-        new_parent: Inode,
+        inode: InodeId,
+        new_parent: InodeId,
         new_name: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<ReplyEntry>> {
         let _ = (req, inode, new_parent, new_name);
@@ -249,7 +249,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn open(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         flags: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyOpen>> {
         let _ = (req, inode, flags);
@@ -265,8 +265,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn read(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         buf: &mut [u8],
     ) -> impl std::future::Future<Output = FsResult<usize>> {
@@ -282,8 +282,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn write(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         data: &[u8],
         write_flags: u32,
@@ -302,8 +302,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn flush(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         lock_owner: u64,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, fh, lock_owner);
@@ -322,8 +322,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn release(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         flags: u32,
         lock_owner: u64,
         flush: bool,
@@ -340,8 +340,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn fsync(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         datasync: bool,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, fh, datasync);
@@ -355,7 +355,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn opendir(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         flags: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyOpen>> {
         let _ = (req, inode, flags);
@@ -372,8 +372,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn readdir(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         size: u32,
     ) -> impl std::future::Future<Output = FsResult<Vec<DirectoryEntry>>> {
@@ -389,8 +389,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn readdirplus(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         size: u32,
     ) -> impl std::future::Future<Output = FsResult<Vec<DirectoryEntryPlus>>> {
@@ -402,8 +402,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn releasedir(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         flags: u32,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, fh, flags);
@@ -417,8 +417,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn fsyncdir(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         datasync: bool,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, fh, datasync);
@@ -434,7 +434,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn statfs(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
     ) -> impl std::future::Future<Output = FsResult<ReplyStatfs>> {
         let _ = (req, inode);
         async {
@@ -459,7 +459,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn access(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         mask: u32,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, mask);
@@ -475,7 +475,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn create(
         &self,
         req: Request,
-        parent: Inode,
+        parent: InodeId,
         name: &OsStr,
         mode: u32,
         flags: u32,
@@ -493,8 +493,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn fallocate(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         length: u64,
         mode: u32,
@@ -510,8 +510,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn lseek(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         offset: u64,
         whence: u32,
     ) -> impl std::future::Future<Output = FsResult<u64>> {
@@ -528,11 +528,11 @@ pub trait Filesystem: Send + Sync + 'static {
     fn copy_file_range(
         &self,
         req: Request,
-        inode_in: Inode,
-        fh_in: u64,
+        inode_in: InodeId,
+        fh_in: FileHandleId,
         off_in: u64,
-        inode_out: Inode,
-        fh_out: u64,
+        inode_out: InodeId,
+        fh_out: FileHandleId,
         off_out: u64,
         length: u64,
         flags: u64,
@@ -550,7 +550,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn setxattr(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         name: &OsStr,
         value: &[u8],
         flags: u32,
@@ -568,7 +568,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn getxattr(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         name: &OsStr,
         size: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyXattr>> {
@@ -583,7 +583,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn listxattr(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         size: u32,
     ) -> impl std::future::Future<Output = FsResult<ReplyXattr>> {
         let _ = (req, inode, size);
@@ -594,7 +594,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn removexattr(
         &self,
         req: Request,
-        inode: Inode,
+        inode: InodeId,
         name: &OsStr,
     ) -> impl std::future::Future<Output = FsResult<()>> {
         let _ = (req, inode, name);
@@ -608,8 +608,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn getlk(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         owner: u64,
         lock: FileLock,
     ) -> impl std::future::Future<Output = FsResult<ReplyLock>> {
@@ -624,8 +624,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn setlk(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         owner: u64,
         lock: FileLock,
         sleep: bool,
@@ -643,8 +643,8 @@ pub trait Filesystem: Send + Sync + 'static {
     fn flock(
         &self,
         req: Request,
-        inode: Inode,
-        fh: u64,
+        inode: InodeId,
+        fh: FileHandleId,
         owner: u64,
         op: u32,
     ) -> impl std::future::Future<Output = FsResult<()>> {

@@ -34,8 +34,9 @@ pub async fn dispatch<F: Filesystem>(
     match opcode {
         FUSE_FORGET => {
             let arg: &fuse_forget_in = header.op_in_as();
-            let result =
-                panic::catch_unwind(AssertUnwindSafe(|| fs.forget(req, nodeid, arg.nlookup)));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                fs.forget(req, InodeId(nodeid), arg.nlookup)
+            }));
             return (None, result);
         }
         FUSE_BATCH_FORGET => {
@@ -50,7 +51,7 @@ pub async fn dispatch<F: Filesystem>(
                     break;
                 }
                 let one = unsafe { &*(payload.as_ptr().add(offset) as *const fuse_forget_one) };
-                inodes.push((one.nodeid, one.nlookup));
+                inodes.push((InodeId(one.nodeid), one.nlookup));
             }
             let result = panic::catch_unwind(AssertUnwindSafe(|| fs.batch_forget(req, &inodes)));
             return (None, result);
@@ -80,6 +81,9 @@ async fn dispatch_with_reply<F: Filesystem>(
     opcode: u32,
     nodeid: u64,
 ) -> DispatchResult {
+    // Wrap the raw wire nodeid once; every trait call below receives the
+    // typed `InodeId`. The debug logs still print it via `Display`.
+    let nodeid = InodeId(nodeid);
     match opcode {
         FUSE_LOOKUP => {
             let name = extract_name_from_payload(entry);
@@ -91,7 +95,7 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_GETATTR => {
             let arg: &fuse_getattr_in = entry.header().op_in_as();
             let fh = if arg.getattr_flags & FUSE_GETATTR_FH != 0 {
-                Some(arg.fh)
+                Some(FileHandleId(arg.fh))
             } else {
                 None
             };
@@ -103,7 +107,7 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_SETATTR => {
             let arg: &fuse_setattr_in = entry.header().op_in_as();
             let fh = if arg.valid & FATTR_FH != 0 {
-                Some(arg.fh)
+                Some(FileHandleId(arg.fh))
             } else {
                 None
             };
@@ -178,7 +182,7 @@ async fn dispatch_with_reply<F: Filesystem>(
                     req,
                     nodeid,
                     OsStr::from_bytes(old_name),
-                    arg.newdir,
+                    InodeId(arg.newdir),
                     OsStr::from_bytes(new_name),
                     0,
                 )
@@ -197,7 +201,7 @@ async fn dispatch_with_reply<F: Filesystem>(
                     req,
                     nodeid,
                     OsStr::from_bytes(old_name),
-                    arg.newdir,
+                    InodeId(arg.newdir),
                     OsStr::from_bytes(new_name),
                     arg.flags,
                 )
@@ -211,7 +215,12 @@ async fn dispatch_with_reply<F: Filesystem>(
             let arg: &fuse_link_in = entry.header().op_in_as();
             let name = extract_name_from_payload(entry);
             match fs
-                .link(req, arg.oldnodeid, nodeid, OsStr::from_bytes(&name))
+                .link(
+                    req,
+                    InodeId(arg.oldnodeid),
+                    nodeid,
+                    OsStr::from_bytes(&name),
+                )
                 .await
             {
                 Ok(reply) => DispatchResult::Entry(reply),
@@ -239,7 +248,7 @@ async fn dispatch_with_reply<F: Filesystem>(
                 .read(
                     req,
                     nodeid,
-                    fh,
+                    FileHandleId(fh),
                     read_offset,
                     &mut entry.payload_mut()[..read_size],
                 )
@@ -257,7 +266,7 @@ async fn dispatch_with_reply<F: Filesystem>(
                 .write(
                     req,
                     nodeid,
-                    arg.fh,
+                    FileHandleId(arg.fh),
                     arg.offset,
                     data,
                     arg.write_flags,
@@ -281,7 +290,7 @@ async fn dispatch_with_reply<F: Filesystem>(
                 .release(
                     req,
                     nodeid,
-                    arg.fh,
+                    FileHandleId(arg.fh),
                     arg.flags,
                     arg.lock_owner,
                     flush,
@@ -296,14 +305,17 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_FSYNC => {
             let arg: &fuse_fsync_in = entry.header().op_in_as();
             let datasync = arg.fsync_flags & 1 != 0;
-            match fs.fsync(req, nodeid, arg.fh, datasync).await {
+            match fs.fsync(req, nodeid, FileHandleId(arg.fh), datasync).await {
                 Ok(()) => DispatchResult::Empty,
                 Err(e) => DispatchResult::Error(e),
             }
         }
         FUSE_FLUSH => {
             let arg: &fuse_flush_in = entry.header().op_in_as();
-            match fs.flush(req, nodeid, arg.fh, arg.lock_owner).await {
+            match fs
+                .flush(req, nodeid, FileHandleId(arg.fh), arg.lock_owner)
+                .await
+            {
                 Ok(()) => DispatchResult::Empty,
                 Err(e) => DispatchResult::Error(e),
             }
@@ -317,7 +329,10 @@ async fn dispatch_with_reply<F: Filesystem>(
         }
         FUSE_READDIR => {
             let arg: &fuse_read_in = entry.header().op_in_as();
-            match fs.readdir(req, nodeid, arg.fh, arg.offset, arg.size).await {
+            match fs
+                .readdir(req, nodeid, FileHandleId(arg.fh), arg.offset, arg.size)
+                .await
+            {
                 Ok(entries) => DispatchResult::Readdir(entries, arg.size),
                 Err(e) => DispatchResult::Error(e),
             }
@@ -325,7 +340,7 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_READDIRPLUS => {
             let arg: &fuse_read_in = entry.header().op_in_as();
             match fs
-                .readdirplus(req, nodeid, arg.fh, arg.offset, arg.size)
+                .readdirplus(req, nodeid, FileHandleId(arg.fh), arg.offset, arg.size)
                 .await
             {
                 Ok(entries) => DispatchResult::Readdirplus(entries, arg.size),
@@ -334,7 +349,10 @@ async fn dispatch_with_reply<F: Filesystem>(
         }
         FUSE_RELEASEDIR => {
             let arg: &fuse_release_in = entry.header().op_in_as();
-            match fs.releasedir(req, nodeid, arg.fh, arg.flags).await {
+            match fs
+                .releasedir(req, nodeid, FileHandleId(arg.fh), arg.flags)
+                .await
+            {
                 Ok(()) => DispatchResult::Empty,
                 Err(e) => DispatchResult::Error(e),
             }
@@ -342,7 +360,10 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_FSYNCDIR => {
             let arg: &fuse_fsync_in = entry.header().op_in_as();
             let datasync = arg.fsync_flags & 1 != 0;
-            match fs.fsyncdir(req, nodeid, arg.fh, datasync).await {
+            match fs
+                .fsyncdir(req, nodeid, FileHandleId(arg.fh), datasync)
+                .await
+            {
                 Ok(()) => DispatchResult::Empty,
                 Err(e) => DispatchResult::Error(e),
             }
@@ -368,7 +389,14 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_FALLOCATE => {
             let arg: &fuse_fallocate_in = entry.header().op_in_as();
             match fs
-                .fallocate(req, nodeid, arg.fh, arg.offset, arg.length, arg.mode)
+                .fallocate(
+                    req,
+                    nodeid,
+                    FileHandleId(arg.fh),
+                    arg.offset,
+                    arg.length,
+                    arg.mode,
+                )
                 .await
             {
                 Ok(()) => DispatchResult::Empty,
@@ -377,7 +405,10 @@ async fn dispatch_with_reply<F: Filesystem>(
         }
         FUSE_LSEEK => {
             let arg: &fuse_lseek_in = entry.header().op_in_as();
-            match fs.lseek(req, nodeid, arg.fh, arg.offset, arg.whence).await {
+            match fs
+                .lseek(req, nodeid, FileHandleId(arg.fh), arg.offset, arg.whence)
+                .await
+            {
                 Ok(offset) => DispatchResult::Lseek(offset),
                 Err(e) => DispatchResult::Error(e),
             }
@@ -388,10 +419,10 @@ async fn dispatch_with_reply<F: Filesystem>(
                 .copy_file_range(
                     req,
                     nodeid,
-                    arg.fh_in,
+                    FileHandleId(arg.fh_in),
                     arg.off_in,
-                    arg.nodeid_out,
-                    arg.fh_out,
+                    InodeId(arg.nodeid_out),
+                    FileHandleId(arg.fh_out),
                     arg.off_out,
                     arg.len,
                     arg.flags,
@@ -413,7 +444,7 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_STATX => {
             let arg: &fuse_statx_in = entry.header().op_in_as();
             let fh = if arg.getattr_flags & FUSE_GETATTR_FH != 0 {
-                Some(arg.fh)
+                Some(FileHandleId(arg.fh))
             } else {
                 None
             };
@@ -470,7 +501,7 @@ async fn dispatch_with_reply<F: Filesystem>(
         FUSE_GETLK => {
             let arg: &fuse_lk_in = entry.header().op_in_as();
             match fs
-                .getlk(req, nodeid, arg.fh, arg.owner, arg.lk.into())
+                .getlk(req, nodeid, FileHandleId(arg.fh), arg.owner, arg.lk.into())
                 .await
             {
                 Ok(reply) => DispatchResult::Lock(reply),
@@ -491,10 +522,18 @@ async fn dispatch_with_reply<F: Filesystem>(
                     libc::LOCK_UN
                 };
                 let op = if sleep { base } else { base | libc::LOCK_NB };
-                fs.flock(req, nodeid, arg.fh, arg.owner, op as u32).await
-            } else {
-                fs.setlk(req, nodeid, arg.fh, arg.owner, arg.lk.into(), sleep)
+                fs.flock(req, nodeid, FileHandleId(arg.fh), arg.owner, op as u32)
                     .await
+            } else {
+                fs.setlk(
+                    req,
+                    nodeid,
+                    FileHandleId(arg.fh),
+                    arg.owner,
+                    arg.lk.into(),
+                    sleep,
+                )
+                .await
             };
             match result {
                 Ok(()) => DispatchResult::Empty,
@@ -592,7 +631,7 @@ fn serialize_response(entry: &mut RingEntry, unique: u64, _opcode: u32, result: 
         }
         DispatchResult::Open(reply) => {
             let out = fuse_open_out {
-                fh: reply.fh,
+                fh: reply.fh.0,
                 open_flags: reply.flags,
                 backing_id: reply.backing_id,
             };
@@ -623,7 +662,7 @@ fn serialize_response(entry: &mut RingEntry, unique: u64, _opcode: u32, result: 
                 attr: reply.attr.to_fuse_attr(),
             };
             let open_out = fuse_open_out {
-                fh: reply.fh,
+                fh: reply.fh.0,
                 open_flags: reply.flags,
                 backing_id: 0,
             };

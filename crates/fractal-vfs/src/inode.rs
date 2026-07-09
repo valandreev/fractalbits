@@ -1,10 +1,11 @@
 use dashmap::DashMap;
 use data_types::object_layout::{ObjectLayout, ObjectState, PosixAttrs};
+use fractal_fuse::InodeId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
-pub const ROOT_INODE: u64 = 1;
+pub const ROOT_INODE: InodeId = InodeId(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntryType {
@@ -139,12 +140,12 @@ impl InodeEntry {
 }
 
 pub struct InodeTable {
-    map: DashMap<u64, InodeEntry>,
+    map: DashMap<InodeId, InodeEntry>,
     next_ino: AtomicU64,
     // Reverse map: (s3_key, entry_type) -> inode for lookup dedup.
     // EntryType is included to avoid aliasing between files and directories
     // with the same key (e.g., a file at "dir/" vs a directory prefix "dir/").
-    key_to_ino: DashMap<(String, EntryType), u64>,
+    key_to_ino: DashMap<(String, EntryType), InodeId>,
 }
 
 impl Default for InodeTable {
@@ -192,7 +193,7 @@ impl InodeTable {
         s3_key: &str,
         entry_type: EntryType,
         layout: Option<ObjectLayout>,
-    ) -> (u64, bool) {
+    ) -> (InodeId, bool) {
         let dedup_key = (s3_key.to_string(), entry_type);
         // Check if we already have this key
         if let Some(existing_ino) = self.key_to_ino.get(&dedup_key) {
@@ -220,27 +221,30 @@ impl InodeTable {
             }
         }
 
-        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+        let ino = InodeId(self.next_ino.fetch_add(1, Ordering::Relaxed));
         self.map
             .insert(ino, InodeEntry::new(s3_key.to_string(), entry_type, layout));
         self.key_to_ino.insert(dedup_key, ino);
         (ino, true)
     }
 
-    pub fn get(&self, ino: u64) -> Option<dashmap::mapref::one::Ref<'_, u64, InodeEntry>> {
+    pub fn get(&self, ino: InodeId) -> Option<dashmap::mapref::one::Ref<'_, InodeId, InodeEntry>> {
         self.map.get(&ino)
     }
 
-    pub fn get_mut(&self, ino: u64) -> Option<dashmap::mapref::one::RefMut<'_, u64, InodeEntry>> {
+    pub fn get_mut(
+        &self,
+        ino: InodeId,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, InodeId, InodeEntry>> {
         self.map.get_mut(&ino)
     }
 
-    pub fn get_s3_key(&self, ino: u64) -> Option<String> {
+    pub fn get_s3_key(&self, ino: InodeId) -> Option<String> {
         self.map.get(&ino).map(|e| e.s3_key.clone())
     }
 
     /// Read-only lookup by key without creating entries or incrementing refcount.
-    pub fn find_ino_by_key(&self, s3_key: &str, entry_type: EntryType) -> Option<u64> {
+    pub fn find_ino_by_key(&self, s3_key: &str, entry_type: EntryType) -> Option<InodeId> {
         self.key_to_ino
             .get(&(s3_key.to_string(), entry_type))
             .map(|r| *r)
@@ -249,7 +253,7 @@ impl InodeTable {
     /// Remove name mapping for an inode (used during unlink/rmdir).
     /// Removes the reverse map entry but keeps the inode in the map for open
     /// file handles. The inode will be fully removed when refcount reaches 0.
-    pub fn remove_name_mapping(&self, ino: u64) {
+    pub fn remove_name_mapping(&self, ino: InodeId) {
         if ino == ROOT_INODE {
             return;
         }
@@ -267,7 +271,7 @@ impl InodeTable {
     /// the inode's primary `s3_key`. Used by `vfs_link` so a hardlink's
     /// new name resolves to the same inode (and the same `inode_id`
     /// resolution cache) as the original.
-    pub fn add_alias(&self, s3_key: &str, entry_type: EntryType, ino: u64) {
+    pub fn add_alias(&self, s3_key: &str, entry_type: EntryType, ino: InodeId) {
         self.key_to_ino
             .insert((s3_key.to_string(), entry_type), ino);
     }
@@ -282,7 +286,7 @@ impl InodeTable {
 
     /// Update the s3_key for an inode (used during rename).
     /// Updates both the inode entry and the reverse map.
-    pub fn update_s3_key(&self, ino: u64, new_key: &str) {
+    pub fn update_s3_key(&self, ino: InodeId, new_key: &str) {
         if let Some(mut entry) = self.map.get_mut(&ino) {
             let old_key = (entry.s3_key.clone(), entry.entry_type);
             self.key_to_ino.remove(&old_key);
@@ -296,7 +300,7 @@ impl InodeTable {
     /// The directory inode itself should already have been updated via
     /// `update_s3_key()` before calling this.
     pub fn rename_children(&self, old_prefix: &str, new_prefix: &str) {
-        let children: Vec<u64> = self
+        let children: Vec<InodeId> = self
             .map
             .iter()
             .filter(|e| {
@@ -319,7 +323,7 @@ impl InodeTable {
 
     /// Forget an inode (decrement refcount). Removes entry when refcount reaches 0.
     /// Root inode is never removed.
-    pub fn forget(&self, ino: u64, nlookup: u64) {
+    pub fn forget(&self, ino: InodeId, nlookup: u64) {
         if ino == ROOT_INODE {
             return;
         }

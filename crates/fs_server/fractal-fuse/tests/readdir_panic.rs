@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 
 use fractal_fuse::abi::FUSE_ROOT_ID;
 use fractal_fuse::{
-    DirectoryEntry, DirectoryEntryPlus, EIO, ENOENT, FileAttr, FileType, Filesystem, FsResult,
-    MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request, Session, Timestamp,
+    DirectoryEntry, DirectoryEntryPlus, EIO, ENOENT, FileAttr, FileHandleId, FileType, Filesystem,
+    FsResult, InodeId, MountOptions, ReplyAttr, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
+    Session, Timestamp,
 };
 
 const HELLO_INO: u64 = 2;
@@ -73,8 +74,8 @@ fn hello_attr() -> FileAttr {
 struct PanicReaddirFs;
 
 impl Filesystem for PanicReaddirFs {
-    async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FsResult<ReplyEntry> {
-        if parent == FUSE_ROOT_ID && name == "hello" {
+    async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
+        if parent.0 == FUSE_ROOT_ID && name == "hello" {
             Ok(ReplyEntry {
                 ttl: TTL,
                 attr: hello_attr(),
@@ -88,11 +89,11 @@ impl Filesystem for PanicReaddirFs {
     async fn getattr(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: Option<u64>,
+        inode: InodeId,
+        _fh: Option<FileHandleId>,
         _flags: u32,
     ) -> FsResult<ReplyAttr> {
-        match inode {
+        match inode.0 {
             FUSE_ROOT_ID => Ok(ReplyAttr {
                 ttl: TTL,
                 attr: dir_attr(FUSE_ROOT_ID),
@@ -105,10 +106,10 @@ impl Filesystem for PanicReaddirFs {
         }
     }
 
-    async fn open(&self, _req: Request, inode: u64, _flags: u32) -> FsResult<ReplyOpen> {
-        if inode == HELLO_INO {
+    async fn open(&self, _req: Request, inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
+        if inode.0 == HELLO_INO {
             Ok(ReplyOpen {
-                fh: 0,
+                fh: FileHandleId(0),
                 flags: 0,
                 backing_id: 0,
             })
@@ -120,12 +121,12 @@ impl Filesystem for PanicReaddirFs {
     async fn read(
         &self,
         _req: Request,
-        inode: u64,
-        _fh: u64,
+        inode: InodeId,
+        _fh: FileHandleId,
         offset: u64,
         buf: &mut [u8],
     ) -> FsResult<usize> {
-        if inode != HELLO_INO {
+        if inode.0 != HELLO_INO {
             return Err(ENOENT);
         }
         let offset = offset as usize;
@@ -138,9 +139,9 @@ impl Filesystem for PanicReaddirFs {
         Ok(src.len())
     }
 
-    async fn opendir(&self, _req: Request, _inode: u64, _flags: u32) -> FsResult<ReplyOpen> {
+    async fn opendir(&self, _req: Request, _inode: InodeId, _flags: u32) -> FsResult<ReplyOpen> {
         Ok(ReplyOpen {
-            fh: 0,
+            fh: FileHandleId(0),
             flags: 0,
             backing_id: 0,
         })
@@ -149,8 +150,8 @@ impl Filesystem for PanicReaddirFs {
     async fn readdir(
         &self,
         _req: Request,
-        _inode: u64,
-        _fh: u64,
+        _inode: InodeId,
+        _fh: FileHandleId,
         _offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntry>> {
@@ -160,15 +161,15 @@ impl Filesystem for PanicReaddirFs {
     async fn readdirplus(
         &self,
         _req: Request,
-        _inode: u64,
-        _fh: u64,
+        _inode: InodeId,
+        _fh: FileHandleId,
         _offset: u64,
         _size: u32,
     ) -> FsResult<Vec<DirectoryEntryPlus>> {
         panic!("injected readdirplus panic (issue #28 regression test)");
     }
 
-    async fn statfs(&self, _req: Request, _inode: u64) -> FsResult<ReplyStatfs> {
+    async fn statfs(&self, _req: Request, _inode: InodeId) -> FsResult<ReplyStatfs> {
         Ok(ReplyStatfs {
             blocks: 0,
             bfree: 0,
@@ -181,7 +182,7 @@ impl Filesystem for PanicReaddirFs {
         })
     }
 
-    async fn access(&self, _req: Request, _inode: u64, _mask: u32) -> FsResult<()> {
+    async fn access(&self, _req: Request, _inode: InodeId, _mask: u32) -> FsResult<()> {
         Ok(())
     }
 }
