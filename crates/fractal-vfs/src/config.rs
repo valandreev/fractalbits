@@ -1,5 +1,31 @@
 use serde::Deserialize;
 use std::time::Duration;
+use strum::EnumString;
+
+/// Writeback-cache durability mode.
+///
+/// `Strict` is the legacy synchronous path: every FUSE op blocks until
+/// the corresponding NSS / BSS RPC completes. `Default` enables the
+/// writeback fast path for the enabled operation slice and falls back
+/// to strict for the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, EnumString)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
+pub enum WritebackMode {
+    #[default]
+    Strict,
+    Default,
+}
+
+fn default_writeback_mode() -> String {
+    "default".to_string()
+}
+fn default_writeback_poll_ms() -> u32 {
+    // Tight by default: the metadata path issues one put_inode per intent
+    // (no batching yet), so a large poll interval just adds latency that
+    // drain_inode_to_barrier (every unlink/rmdir/close) then waits out. An
+    // operator can still raise this to widen the batch-accumulation window.
+    2
+}
 
 fn default_prefetch_full_threshold_mb() -> u64 {
     256
@@ -57,6 +83,14 @@ pub struct Config {
     /// this fraction of capacity (0.0-1.0). Default 0.90.
     #[serde(default = "default_prefetch_pressure_decline")]
     pub prefetch_pressure_decline: f64,
+
+    /// Writeback durability mode; `default` (cache on) or `strict`.
+    #[serde(default = "default_writeback_mode")]
+    pub writeback_mode: String,
+    /// Writeback worker poll interval in ms (default 2); the drainer polls
+    /// this often. Clamped to 1..=1000 at startup.
+    #[serde(default = "default_writeback_poll_ms")]
+    pub writeback_poll_ms: u32,
 }
 
 impl Config {
@@ -104,6 +138,12 @@ impl Config {
         if let Ok(v) = std::env::var("FS_SERVER_WORKER_THREADS") {
             self.worker_threads = v.parse().unwrap_or(self.worker_threads);
         }
+        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_MODE") {
+            self.writeback_mode = v;
+        }
+        if let Ok(v) = std::env::var("FS_SERVER_WRITEBACK_POLL_MS") {
+            self.writeback_poll_ms = v.parse().unwrap_or(self.writeback_poll_ms);
+        }
         if let Ok(v) = std::env::var("FS_SERVER_ALLOW_OTHER") {
             self.allow_other = v.parse().unwrap_or(self.allow_other);
         }
@@ -135,6 +175,8 @@ impl Default for Config {
             prefetch_partial_threshold_mb: default_prefetch_partial_threshold_mb(),
             workload_bulk_read: false,
             prefetch_pressure_decline: default_prefetch_pressure_decline(),
+            writeback_mode: default_writeback_mode(),
+            writeback_poll_ms: default_writeback_poll_ms(),
         }
     }
 }

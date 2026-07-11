@@ -71,7 +71,29 @@ impl Filesystem for FuseServer {
     }
 
     async fn destroy(&self) {
+        // Block new enqueues, then await a full writeback drain so queued
+        // metadata intents (mkdir directory markers, chmod/chown/utimes,
+        // symlink/mknod) are persisted before the process exits. Without the
+        // await, a shutdown with a non-empty queue loses that metadata: the
+        // dir/file still resolves via its NSS data/children, but its posix
+        // reverts to defaults (uid 0, epoch-0 mtime) on the next mount. This
+        // reuses the same generation-aware barrier as fsyncdir(2), so it
+        // only waits for the worker to commit what is already queued.
+        // Dirty handles are flushed first because FUSE_RELEASE can still be
+        // queued when destroy starts. The until-empty variant then
+        // re-snapshots so a cycle enqueued after the first snapshot is
+        // waited on too; vfs_destroy's enqueue block guarantees progress.
         self.vfs.vfs_destroy();
+        // A failure here (e.g. NSS unreachable through the drain deadline)
+        // means buffered data / queued metadata could not be persisted and
+        // is lost on this otherwise-clean unmount: log at error level, not
+        // as a warning, so it is not mistaken for a benign shutdown notice.
+        if let Err(e) = self.vfs.flush_open_dirty_handles().await {
+            tracing::error!(error = %e, "destroy: dirty handle flush incomplete; buffered data lost");
+        }
+        if let Err(e) = self.vfs.drain_all_dirty_cycles_until_empty().await {
+            tracing::error!(error = %e, "destroy: writeback drain incomplete; queued metadata lost");
+        }
     }
 
     async fn lookup(&self, _req: Request, parent: InodeId, name: &OsStr) -> FsResult<ReplyEntry> {
@@ -86,8 +108,8 @@ impl Filesystem for FuseServer {
             // the kernel the name is absent, so the next LOOKUP for the
             // same (parent, name), e.g. tar's CREATE precheck, is
             // served from the dcache and never reaches us. vfs_lookup
-            // already serves open-handle entries, so a NotFound here is
-            // a genuine absence. Safe under 1W:NR:
+            // already serves pending-writeback and open-handle entries,
+            // so a NotFound here is a genuine absence. Safe under 1W:NR:
             // the CREATE that follows promotes the dentry to positive,
             // and the TTL bounds any staleness window.
             Err(FsError::NotFound) => Ok(ReplyEntry {
@@ -143,10 +165,11 @@ impl Filesystem for FuseServer {
                 self.vfs.vfs_getattr_inmem(inode, fh).map_err(fs_err)?
             };
             let is_owner = cur.uid == req.uid;
-            // chmod by a non-owner is EPERM. The kernel never forwards a
-            // suid-clear-on-write as a setattr, so there is no kernel-
-            // driven mode change to exempt here; the open() handler does
-            // the anticipatory clear instead.
+            // chmod by a non-owner is EPERM. In writeback-cache mode the
+            // kernel never forwards a suid-clear-on-write as a setattr
+            // (the cache absorbs the write), so there is no kernel-driven
+            // mode change to exempt here; the open() handler does the
+            // anticipatory clear instead.
             if set_attr.mode.is_some() && !is_owner {
                 return Err(libc::EPERM);
             }
@@ -381,10 +404,20 @@ impl Filesystem for FuseServer {
         fh: FileHandleId,
         _lock_owner: u64,
     ) -> FsResult<()> {
-        // FUSE_FLUSH fires on every close(2). Publish the buffered write
-        // through to BSS+NSS synchronously so the data is durable and
-        // visible to a read-after-close before close() returns.
-        self.vfs.vfs_flush(fh).await.map_err(fs_err)
+        // FUSE_FLUSH fires on every close(2). Default writeback mode does
+        // no work here: the actual publish runs in FUSE_RELEASE, off the
+        // FUSE worker thread (see `release`). That lets create-heavy
+        // workloads (tar -xf, cp -r) pipeline closes instead of serialising
+        // each one against a synchronous BSS+NSS publish. Read-after-close
+        // visibility is preserved by vfs_open, which publishes any dirty
+        // buffered writes for the inode inline before snapshotting the
+        // layout (covering an OPEN that wins the race against RELEASE, and
+        // a dup'ed fd whose last close never sends one). A close-time
+        // flush error is recorded as a deferred taint and surfaces on the
+        // next fsync / open of the same path; use
+        // FS_SERVER_WRITEBACK_MODE=strict when close must synchronously
+        // report writeback errors.
+        self.vfs.vfs_flush_for_close(fh).await.map_err(fs_err)
     }
 
     async fn fsync(
@@ -394,8 +427,7 @@ impl Filesystem for FuseServer {
         fh: FileHandleId,
         _datasync: bool,
     ) -> FsResult<()> {
-        // fsync(2) is a durability request: publish the buffered write
-        // through to BSS+NSS synchronously.
+        // fsync(2) is a durability request: drain the writeback barrier.
         self.vfs.vfs_flush(fh).await.map_err(fs_err)
     }
 
@@ -436,9 +468,17 @@ impl Filesystem for FuseServer {
         _flock_release: bool,
     ) -> FsResult<()> {
         self.vfs.release_passthrough(fh);
-        // Tear down the handle and inode write lock. The buffered write
-        // was already published at FUSE_FLUSH; a still-dirty buffer here
-        // (e.g. a write with no intervening flush) is published inline.
+        // In Default writeback mode a dirty handle flushes asynchronously:
+        // spawn the publish off the FUSE worker thread and reply to the
+        // kernel immediately, so distinct-inode closes (every tar file)
+        // pipeline their BSS+NSS round-trips instead of serialising. The
+        // spawned flush registers a writeback cycle, so fsync / unlink /
+        // open barriers still wait for it. Read-only / clean handles and
+        // Strict mode fall through to the synchronous inline release.
+        if let Some(ino) = self.vfs.peek_release_state(fh) {
+            self.vfs.clone().spawn_release_flush(fh, ino);
+            return Ok(());
+        }
         self.vfs.vfs_release(fh).await.map_err(fs_err)
     }
 
@@ -678,12 +718,17 @@ impl Filesystem for FuseServer {
     async fn fsyncdir(
         &self,
         _req: Request,
-        _inode: InodeId,
+        inode: InodeId,
         _fh: FileHandleId,
         _datasync: bool,
     ) -> FsResult<()> {
-        // Directory metadata is published synchronously, so there is
-        // nothing to drain here.
+        // Drain every dirty writeback cycle the queue currently knows
+        // about (cheap mount-wide barrier; a true subtree-scoped variant
+        // is a future optimization), then surface deferred publish
+        // failures for entries under this directory: the create + close +
+        // fsync(dirfd) durability protocol never re-opens the child, so
+        // this is its only chance to see a dropped child publish.
+        self.vfs.vfs_fsyncdir(inode).await.map_err(fs_err)?;
         Ok(())
     }
 

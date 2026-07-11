@@ -13,3 +13,4 @@ pub mod inode;
 pub mod prefetch;
 pub mod slice_mut;
 pub mod vfs;
+pub mod writeback;
